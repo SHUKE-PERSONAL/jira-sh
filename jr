@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 # jr - Jira Cloud CLI
-# Source this file in ~/.bashrc:  source /path/to/jr.sh
 
 _jr_check_env() {
   local missing=()
-  [[ -z "${JIRA_BASE:-}"    ]] && missing+=(JIRA_BASE)
-  [[ -z "${JIRA_EMAIL:-}"   ]] && missing+=(JIRA_EMAIL)
-  [[ -z "${JIRA_TOKEN:-}"   ]] && missing+=(JIRA_TOKEN)
+  [[ -z "${JIRA_BASE:-}"             ]] && missing+=(JIRA_BASE)
+  [[ -z "${JIRA_EMAIL:-}"            ]] && missing+=(JIRA_EMAIL)
+  [[ -z "${JIRA_TOKEN:-}"            ]] && missing+=(JIRA_TOKEN)
   [[ -z "${JIRA_PROJECT_PREFIXES:-}" ]] && missing+=(JIRA_PROJECT_PREFIXES)
   if [[ ${#missing[@]} -gt 0 ]]; then
     echo "jr: missing env vars: ${missing[*]}" >&2
     echo "    Set them in ~/.bashrc or source a .env file" >&2
-    return 1
+    exit 1
   fi
 }
 
@@ -63,21 +62,6 @@ print(json.dumps({
 }))" "$1"
 }
 
-_jr_transition_id() {
-  local ticket=$1 status=$2
-  local transitions
-  transitions=$(_jr_api GET "/issue/$ticket/transitions") || return 1
-  python3 -c "
-import json, sys
-data = json.loads(sys.argv[1])
-target = sys.argv[2].lower()
-for t in data.get('transitions', []):
-    if t['name'].lower() == target:
-        print(t['id']); sys.exit(0)
-sys.exit(1)
-" "$transitions" "$status"
-}
-
 _jr_transition_names() {
   local transitions=$1
   python3 -c "
@@ -87,11 +71,10 @@ for t in json.loads(sys.argv[1]).get('transitions', []):
 " "$transitions"
 }
 
-jr_move() {
+cmd_move() {
   [[ $# -lt 2 ]] && { echo "Usage: jr move <TICKET> <STATUS>" >&2; return 1; }
   local ticket status
   ticket=$(_jr_resolve_ticket "$1") || return 1; status=$2
-  local transitions tid
 
   local issue
   issue=$(_jr_api GET "/issue/$ticket?fields=assignee") || { echo "jr: ticket not found: $ticket" >&2; return 1; }
@@ -128,6 +111,7 @@ else:
     print('NONE:')
 " "$status" "$transitions")
 
+  local tid
   case "$result" in
     OK:*)        tid=${result#OK:} ;;
     AMBIGUOUS:*) echo "jr: '$status' is ambiguous: ${result#AMBIGUOUS:}" >&2; return 1 ;;
@@ -139,7 +123,7 @@ else:
   echo "$ticket → $status"
 }
 
-jr_comment() {
+cmd_comment() {
   [[ $# -lt 2 ]] && { echo "Usage: jr comment <TICKET> <TEXT>" >&2; return 1; }
   local ticket
   ticket=$(_jr_resolve_ticket "$1") || return 1; shift
@@ -149,7 +133,7 @@ jr_comment() {
   echo "comment added to $ticket"
 }
 
-jr_transitions() {
+cmd_transitions() {
   [[ $# -lt 1 ]] && { echo "Usage: jr transitions <TICKET>" >&2; return 1; }
   local ticket transitions
   ticket=$(_jr_resolve_ticket "$1") || return 1
@@ -162,7 +146,7 @@ for t in json.loads(sys.argv[1]).get('transitions', []):
 " "$transitions"
 }
 
-jr_users() {
+cmd_users() {
   [[ $# -lt 1 ]] && { echo "Usage: jr users <TICKET> [query]" >&2; return 1; }
   local ticket
   ticket=$(_jr_resolve_ticket "$1") || return 1
@@ -182,7 +166,7 @@ else:
 " "$result"
 }
 
-jr_assign() {
+cmd_assign() {
   [[ $# -lt 2 ]] && { echo "Usage: jr assign <TICKET> <NAME>" >&2; return 1; }
   local ticket
   ticket=$(_jr_resolve_ticket "$1") || return 1
@@ -225,7 +209,7 @@ else:
   esac
 }
 
-jr_help() {
+cmd_help() {
   cat <<'EOF'
 Usage: jr <command> [args]
 
@@ -238,24 +222,22 @@ Commands:
   help                            Show this help
 
 Required env vars:
-  JIRA_BASE      https://yourcompany.atlassian.net
-  JIRA_EMAIL     your@email.com
-  JIRA_TOKEN     your-api-token
-  JIRA_PROJECT_PREFIXES   pipe-separated project keys (e.g. MT|DOS) — lets you use bare numbers as ticket IDs
+  JIRA_BASE             https://yourcompany.atlassian.net
+  JIRA_EMAIL            your@email.com
+  JIRA_TOKEN            your-api-token
+  JIRA_PROJECT_PREFIXES pipe-separated project keys (e.g. MT|DOS) — lets you use bare numbers as ticket IDs
 EOF
 }
 
-jr() {
-  _jr_check_env || return 1
-  local cmd=${1:-help}
-  shift 2>/dev/null || true
-  case "$cmd" in
-    move|mv)      jr_move        "$@" ;;
-    comment)      jr_comment     "$@" ;;
-    transitions)  jr_transitions "$@" ;;
-    assign)       jr_assign      "$@" ;;
-    users)        jr_users       "$@" ;;
-    help|--help|-h) jr_help  ;;
-    *) echo "jr: unknown command '$cmd'" >&2; jr_help >&2; return 1 ;;
-  esac
-}
+_jr_check_env
+cmd=${1:-help}
+shift 2>/dev/null || true
+case "$cmd" in
+  move|mv)       cmd_move        "$@" ;;
+  comment)       cmd_comment     "$@" ;;
+  transitions)   cmd_transitions "$@" ;;
+  assign)        cmd_assign      "$@" ;;
+  users)         cmd_users       "$@" ;;
+  help|--help|-h) cmd_help ;;
+  *) echo "jr: unknown command '$cmd'" >&2; cmd_help >&2; exit 1 ;;
+esac
