@@ -176,7 +176,7 @@ Required env vars:
   JIRA_BASE      https://yourcompany.atlassian.net
   JIRA_EMAIL     your@email.com
   JIRA_TOKEN     your-api-token
-  JIRA_PROJECT_PREFIXES   pipe-separated project keys (e.g. MTY|DOS) — lets you use bare numbers as ticket IDs
+  JIRA_PROJECT_PREFIXES   pipe-separated project keys (e.g. MT|DOS) — lets you use bare numbers as ticket IDs
 EOF
 }
 
