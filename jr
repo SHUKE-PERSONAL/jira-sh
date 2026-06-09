@@ -3,9 +3,9 @@
 
 _jr_check_env() {
   local missing=()
-  [[ -z "${JIRA_BASE:-}"             ]] && missing+=(JIRA_BASE)
-  [[ -z "${JIRA_EMAIL:-}"            ]] && missing+=(JIRA_EMAIL)
-  [[ -z "${JIRA_TOKEN:-}"            ]] && missing+=(JIRA_TOKEN)
+  [[ -z "${JIRA_BASE:-}"  ]] && missing+=(JIRA_BASE)
+  [[ -z "${JIRA_EMAIL:-}" ]] && missing+=(JIRA_EMAIL)
+  [[ -z "${JIRA_TOKEN:-}" ]] && missing+=(JIRA_TOKEN)
   JIRA_PROJECT_PREFIXES=${JIRA_PROJECT_PREFIXES:-MT|DOS}
   if [[ ${#missing[@]} -gt 0 ]]; then
     echo "jr: missing env vars: ${missing[*]}" >&2
@@ -62,15 +62,6 @@ print(json.dumps({
 }))" "$1"
 }
 
-_jr_transition_names() {
-  local transitions=$1
-  python3 -c "
-import json, sys
-for t in json.loads(sys.argv[1]).get('transitions', []):
-    print(' ', t['name'])
-" "$transitions"
-}
-
 cmd_move() {
   [[ $# -lt 2 ]] && { echo "Usage: jr move <TICKET> <STATUS>" >&2; return 1; }
   local ticket status
@@ -79,11 +70,11 @@ cmd_move() {
   local issue
   issue=$(_jr_api GET "/issue/$ticket?fields=assignee") || { echo "jr: ticket not found: $ticket" >&2; return 1; }
   local assignee
-  assignee=$(python3 -c "
+  assignee=$(echo "$issue" | python3 -c "
 import json, sys
-a = json.loads(sys.argv[1]).get('fields', {}).get('assignee') or {}
+a = json.loads(sys.stdin.read()).get('fields', {}).get('assignee') or {}
 print(a.get('emailAddress', ''))
-" "$issue")
+")
   if [[ -n "$assignee" && "$assignee" != "$JIRA_EMAIL" ]]; then
     echo "jr: $ticket is assigned to $assignee, not you."
     read -r -p "Move anyway? [y/N] " confirm
@@ -93,10 +84,10 @@ print(a.get('emailAddress', ''))
   local transitions
   transitions=$(_jr_api GET "/issue/$ticket/transitions") || return 1
   local result
-  result=$(python3 -c "
+  result=$(echo "$transitions" | python3 -c "
 import json, sys
 target = sys.argv[1].lower()
-ts = json.loads(sys.argv[2]).get('transitions', [])
+ts = json.loads(sys.stdin.read()).get('transitions', [])
 for t in ts:
     dest = t.get('to', {}).get('name', '').lower()
     if dest == target or t['name'].lower() == target:
@@ -109,14 +100,18 @@ if len(matches) > 1:
     print('AMBIGUOUS:' + ', '.join(t.get('to',{}).get('name','') for t in matches))
 else:
     print('NONE:')
-" "$status" "$transitions")
+" "$status")
 
   local tid
   case "$result" in
     OK:*)        tid=${result#OK:} ;;
     AMBIGUOUS:*) echo "jr: '$status' is ambiguous: ${result#AMBIGUOUS:}" >&2; return 1 ;;
     *)           echo "jr: no transition to '$status'. Available targets:" >&2
-                 _jr_transition_names "$transitions" >&2; return 1 ;;
+                 echo "$transitions" | python3 -c "
+import json, sys
+for t in json.loads(sys.stdin.read()).get('transitions', []):
+    print(' ', t['name'])
+" >&2; return 1 ;;
   esac
 
   _jr_api POST "/issue/$ticket/transitions" "{\"transition\":{\"id\":\"$tid\"}}" > /dev/null
@@ -135,15 +130,14 @@ cmd_comment() {
 
 cmd_transitions() {
   [[ $# -lt 1 ]] && { echo "Usage: jr transitions <TICKET>" >&2; return 1; }
-  local ticket transitions
+  local ticket
   ticket=$(_jr_resolve_ticket "$1") || return 1
-  transitions=$(_jr_api GET "/issue/$ticket/transitions") || return 1
-  python3 -c "
+  _jr_api GET "/issue/$ticket/transitions" | python3 -c "
 import json, sys
-for t in json.loads(sys.argv[1]).get('transitions', []):
+for t in json.loads(sys.stdin.read()).get('transitions', []):
     dest = t.get('to', {}).get('name', '')
-    print(f\"  {dest:25s} <- {t['name']}\")
-" "$transitions"
+    print(f'  {dest:25s} <- {t[\"name\"]}')
+"
 }
 
 cmd_users() {
@@ -153,17 +147,15 @@ cmd_users() {
   local query=${2:-}
   local url="/user/assignable/search?issueKey=${ticket}&maxResults=50"
   [[ -n "$query" ]] && url+="&query=${query}"
-  local result
-  result=$(_jr_api GET "$url") || { echo "jr: failed to fetch users for $ticket" >&2; return 1; }
-  python3 -c "
+  _jr_api GET "$url" | python3 -c "
 import json, sys
-users = json.loads(sys.argv[1])
+users = json.loads(sys.stdin.read())
 if not users:
     print('  (no assignable users found)')
 else:
     for u in users:
-        print(f\"  {u.get('displayName','?'):30s} {u.get('emailAddress','')}\")
-" "$result"
+        print(f'  {u.get(\"displayName\",\"?\"):30s} {u.get(\"emailAddress\",\"\")}')
+"
 }
 
 cmd_assign() {
@@ -176,10 +168,10 @@ cmd_assign() {
     echo "jr: failed to fetch users for $ticket" >&2; return 1
   }
   local match
-  match=$(python3 -c "
+  match=$(echo "$result" | python3 -c "
 import json, sys
-users = json.loads(sys.argv[1])
-q = sys.argv[2].lower()
+users = json.loads(sys.stdin.read())
+q = sys.argv[1].lower()
 matches = [u for u in users if q in u.get('displayName','').lower() or q in u.get('emailAddress','').lower()]
 if len(matches) == 1:
     print('OK:' + matches[0]['accountId'] + ':' + matches[0]['displayName'])
@@ -187,7 +179,7 @@ elif len(matches) == 0:
     print('NONE:')
 else:
     print('AMBIGUOUS:' + '\n'.join(f\"{u.get('displayName','?')} <{u.get('emailAddress','')}>\".strip() for u in matches))
-" "$result" "$query")
+" "$query")
 
   case "$match" in
     OK:*)
@@ -233,11 +225,11 @@ _jr_check_env
 cmd=${1:-help}
 shift 2>/dev/null || true
 case "$cmd" in
-  move|mv)       cmd_move        "$@" ;;
-  comment)       cmd_comment     "$@" ;;
-  transitions)   cmd_transitions "$@" ;;
-  assign)        cmd_assign      "$@" ;;
-  users)         cmd_users       "$@" ;;
+  move|mv)        cmd_move        "$@" ;;
+  comment)        cmd_comment     "$@" ;;
+  transitions)    cmd_transitions "$@" ;;
+  assign)         cmd_assign      "$@" ;;
+  users)          cmd_users       "$@" ;;
   help|--help|-h) cmd_help ;;
   *) echo "jr: unknown command '$cmd'" >&2; cmd_help >&2; exit 1 ;;
 esac
