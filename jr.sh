@@ -72,18 +72,31 @@ jr_move() {
   local transitions tid
 
   transitions=$(_jr_api GET "/issue/$ticket/transitions") || return 1
-  tid=$(python3 -c "
+  local result
+  result=$(python3 -c "
 import json, sys
 target = sys.argv[1].lower()
-for t in json.loads(sys.argv[2]).get('transitions', []):
-    if t.get('to', {}).get('name', '').lower() == target or t['name'].lower() == target:
-        print(t['id']); sys.exit(0)
-sys.exit(1)
-" "$status" "$transitions") || {
-    echo "jr: no transition to '$status'. Available targets:" >&2
-    _jr_transition_names "$transitions" >&2
-    return 1
-  }
+ts = json.loads(sys.argv[2]).get('transitions', [])
+for t in ts:
+    dest = t.get('to', {}).get('name', '').lower()
+    if dest == target or t['name'].lower() == target:
+        print('OK:' + t['id']); sys.exit(0)
+words = target.split()
+matches = [t for t in ts if all(w in t.get('to', {}).get('name', '').lower() for w in words)]
+if len(matches) == 1:
+    print('OK:' + matches[0]['id']); sys.exit(0)
+if len(matches) > 1:
+    print('AMBIGUOUS:' + ', '.join(t.get('to',{}).get('name','') for t in matches))
+else:
+    print('NONE:')
+" "$status" "$transitions")
+
+  case "$result" in
+    OK:*)        tid=${result#OK:} ;;
+    AMBIGUOUS:*) echo "jr: '$status' is ambiguous: ${result#AMBIGUOUS:}" >&2; return 1 ;;
+    *)           echo "jr: no transition to '$status'. Available targets:" >&2
+                 _jr_transition_names "$transitions" >&2; return 1 ;;
+  esac
 
   _jr_api POST "/issue/$ticket/transitions" "{\"transition\":{\"id\":\"$tid\"}}" > /dev/null
   echo "$ticket → $status"
