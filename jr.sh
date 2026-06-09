@@ -4,14 +4,20 @@
 
 _jr_check_env() {
   local missing=()
-  [[ -z "${JIRA_BASE:-}"  ]] && missing+=(JIRA_BASE)
-  [[ -z "${JIRA_EMAIL:-}" ]] && missing+=(JIRA_EMAIL)
-  [[ -z "${JIRA_TOKEN:-}" ]] && missing+=(JIRA_TOKEN)
+  [[ -z "${JIRA_BASE:-}"    ]] && missing+=(JIRA_BASE)
+  [[ -z "${JIRA_EMAIL:-}"   ]] && missing+=(JIRA_EMAIL)
+  [[ -z "${JIRA_TOKEN:-}"   ]] && missing+=(JIRA_TOKEN)
+  [[ -z "${JIRA_PROJECT:-}" ]] && missing+=(JIRA_PROJECT)
   if [[ ${#missing[@]} -gt 0 ]]; then
     echo "jr: missing env vars: ${missing[*]}" >&2
     echo "    Set them in ~/.bashrc or source a .env file" >&2
     return 1
   fi
+}
+
+_jr_resolve_ticket() {
+  local t=$1
+  [[ "$t" =~ ^[0-9]+$ ]] && echo "${JIRA_PROJECT}-${t}" || echo "$t"
 }
 
 _jr_auth() {
@@ -68,7 +74,8 @@ for t in json.loads(sys.argv[1]).get('transitions', []):
 
 jr_move() {
   [[ $# -lt 2 ]] && { echo "Usage: jr move <TICKET> <STATUS>" >&2; return 1; }
-  local ticket=$1 status=$2
+  local ticket status
+  ticket=$(_jr_resolve_ticket "$1"); status=$2
   local transitions tid
 
   transitions=$(_jr_api GET "/issue/$ticket/transitions") || { echo "jr: ticket not found: $ticket" >&2; return 1; }
@@ -104,7 +111,8 @@ else:
 
 jr_comment() {
   [[ $# -lt 2 ]] && { echo "Usage: jr comment <TICKET> <TEXT>" >&2; return 1; }
-  local ticket=$1; shift
+  local ticket
+  ticket=$(_jr_resolve_ticket "$1"); shift
   local body
   body=$(_jr_json_comment_body "$*") || return 1
   _jr_api POST "/issue/$ticket/comment" "$body" > /dev/null
@@ -113,8 +121,9 @@ jr_comment() {
 
 jr_transitions() {
   [[ $# -lt 1 ]] && { echo "Usage: jr transitions <TICKET>" >&2; return 1; }
-  local transitions
-  transitions=$(_jr_api GET "/issue/$1/transitions") || return 1
+  local ticket transitions
+  ticket=$(_jr_resolve_ticket "$1")
+  transitions=$(_jr_api GET "/issue/$ticket/transitions") || return 1
   python3 -c "
 import json, sys
 for t in json.loads(sys.argv[1]).get('transitions', []):
@@ -134,9 +143,10 @@ Commands:
   help                            Show this help
 
 Required env vars:
-  JIRA_BASE    https://yourcompany.atlassian.net
-  JIRA_EMAIL   your@email.com
-  JIRA_TOKEN   your-api-token
+  JIRA_BASE      https://yourcompany.atlassian.net
+  JIRA_EMAIL     your@email.com
+  JIRA_TOKEN     your-api-token
+  JIRA_PROJECT   default project key (e.g. MTY) — lets you use bare numbers as ticket IDs
 EOF
 }
 
