@@ -98,14 +98,26 @@ jr_comment() {
   echo "comment added to $ticket"
 }
 
+jr_transitions() {
+  [[ $# -lt 1 ]] && { echo "Usage: jr transitions <TICKET>" >&2; return 1; }
+  local transitions
+  transitions=$(_jr_api GET "/issue/$1/transitions") || return 1
+  python3 -c "
+import json, sys
+for t in json.loads(sys.argv[1]).get('transitions', []):
+    print(f\"  {t['name']:30s}  (id: {t['id']})\")
+" "$transitions"
+}
+
 jr_help() {
   cat <<'EOF'
 Usage: jr <command> [args]
 
 Commands:
-  move    <TICKET> <STATUS>   Transition a ticket to a new status
-  comment <TICKET> <TEXT>     Add a comment to a ticket
-  help                        Show this help
+  move        <TICKET> <STATUS>   Transition a ticket to a new status
+  comment     <TICKET> <TEXT>     Add a comment to a ticket
+  transitions <TICKET>            List available transitions for a ticket
+  help                            Show this help
 
 Required env vars:
   JIRA_BASE    https://yourcompany.atlassian.net
@@ -119,8 +131,9 @@ jr() {
   local cmd=${1:-help}
   shift 2>/dev/null || true
   case "$cmd" in
-    move)         jr_move    "$@" ;;
-    comment)      jr_comment "$@" ;;
+    move)         jr_move        "$@" ;;
+    comment)      jr_comment     "$@" ;;
+    transitions)  jr_transitions "$@" ;;
     help|--help|-h) jr_help  ;;
     *) echo "jr: unknown command '$cmd'" >&2; jr_help >&2; return 1 ;;
   esac
