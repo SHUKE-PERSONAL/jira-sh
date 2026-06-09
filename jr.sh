@@ -162,6 +162,69 @@ for t in json.loads(sys.argv[1]).get('transitions', []):
 " "$transitions"
 }
 
+jr_users() {
+  [[ $# -lt 1 ]] && { echo "Usage: jr users <TICKET> [query]" >&2; return 1; }
+  local ticket
+  ticket=$(_jr_resolve_ticket "$1") || return 1
+  local query=${2:-}
+  local url="/user/assignable/search?issueKey=${ticket}&maxResults=50"
+  [[ -n "$query" ]] && url+="&query=${query}"
+  local result
+  result=$(_jr_api GET "$url") || { echo "jr: failed to fetch users for $ticket" >&2; return 1; }
+  python3 -c "
+import json, sys
+users = json.loads(sys.argv[1])
+if not users:
+    print('  (no assignable users found)')
+else:
+    for u in users:
+        print(f\"  {u.get('displayName','?'):30s} {u.get('emailAddress','')}\")
+" "$result"
+}
+
+jr_assign() {
+  [[ $# -lt 2 ]] && { echo "Usage: jr assign <TICKET> <NAME>" >&2; return 1; }
+  local ticket
+  ticket=$(_jr_resolve_ticket "$1") || return 1
+  local query=$2
+  local result
+  result=$(_jr_api GET "/user/assignable/search?issueKey=${ticket}&query=${query}&maxResults=10") || {
+    echo "jr: failed to fetch users for $ticket" >&2; return 1
+  }
+  local match
+  match=$(python3 -c "
+import json, sys
+users = json.loads(sys.argv[1])
+q = sys.argv[2].lower()
+matches = [u for u in users if q in u.get('displayName','').lower() or q in u.get('emailAddress','').lower()]
+if len(matches) == 1:
+    print('OK:' + matches[0]['accountId'] + ':' + matches[0]['displayName'])
+elif len(matches) == 0:
+    print('NONE:')
+else:
+    print('AMBIGUOUS:' + '\n'.join(f\"{u.get('displayName','?')} <{u.get('emailAddress','')}>\".strip() for u in matches))
+" "$result" "$query")
+
+  case "$match" in
+    OK:*)
+      local account_id display_name
+      account_id=${match#OK:}; account_id=${account_id%%:*}
+      display_name=${match#OK:*:}
+      _jr_api PUT "/issue/$ticket/assignee" "{\"accountId\":\"$account_id\"}" > /dev/null
+      echo "$ticket → assigned to $display_name"
+      ;;
+    AMBIGUOUS:*)
+      echo "jr: '$query' matches multiple users:" >&2
+      echo "${match#AMBIGUOUS:}" | sed 's/^/  /' >&2
+      return 1
+      ;;
+    *)
+      echo "jr: no assignable user matching '$query' on $ticket" >&2
+      return 1
+      ;;
+  esac
+}
+
 jr_help() {
   cat <<'EOF'
 Usage: jr <command> [args]
@@ -170,6 +233,8 @@ Commands:
   move        <TICKET> <STATUS>   Transition a ticket to a new status
   comment     <TICKET> <TEXT>     Add a comment to a ticket
   transitions <TICKET>            List available transitions for a ticket
+  assign      <TICKET> <NAME>     Assign ticket to a user (fuzzy name/email match)
+  users       <TICKET> [query]    List assignable users for a ticket
   help                            Show this help
 
 Required env vars:
@@ -188,6 +253,8 @@ jr() {
     move|mv)      jr_move        "$@" ;;
     comment)      jr_comment     "$@" ;;
     transitions)  jr_transitions "$@" ;;
+    assign)       jr_assign      "$@" ;;
+    users)        jr_users       "$@" ;;
     help|--help|-h) jr_help  ;;
     *) echo "jr: unknown command '$cmd'" >&2; jr_help >&2; return 1 ;;
   esac
