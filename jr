@@ -51,6 +51,52 @@ _jr_api() {
   curl "${args[@]}" "$url"
 }
 
+# Like _jr_api but without -f: emits the response body followed by a final
+# line containing the HTTP status code, so callers can inspect both.
+_jr_api_status() {
+  local method=$1 path=$2 data=${3:-}
+  local url="$JIRA_BASE/rest/api/3$path"
+  local auth
+  auth=$(_jr_auth)
+  local args=(-s -w '\n%{http_code}' -X "$method"
+    -H "Authorization: Basic $auth"
+    -H "Content-Type: application/json"
+    -H "Accept: application/json")
+  [[ -n "$data" ]] && args+=(-d "$data")
+  curl "${args[@]}" "$url"
+}
+
+# POST a transition, reporting real failures. Some transitions enforce a
+# "Time Spent" validator; we then prompt for the time to log (Jira's documented
+# bypass is 0m, which is the default if you just press Enter).
+_jr_do_transition() {
+  local ticket=$1 tid=$2 status=$3
+  local resp code body
+  resp=$(_jr_api_status POST "/issue/$ticket/transitions" "{\"transition\":{\"id\":\"$tid\"}}")
+  code=${resp##*$'\n'}; body=${resp%$'\n'*}
+  if [[ ! "$code" =~ ^2 ]] && echo "$body" | grep -qi "time spent"; then
+    local spent
+    read -r -p "$status requires a Time Spent (e.g. 30m, 1h). [Enter = 0m to bypass]: " spent
+    spent=${spent:-0m}
+    resp=$(_jr_api_status POST "/issue/$ticket/transitions" \
+      "{\"transition\":{\"id\":\"$tid\"},\"update\":{\"worklog\":[{\"add\":{\"timeSpent\":\"$spent\"}}]}}")
+    code=${resp##*$'\n'}; body=${resp%$'\n'*}
+  fi
+  if [[ ! "$code" =~ ^2 ]]; then
+    echo "jr: failed to move $ticket to '$status' (HTTP $code)" >&2
+    echo "$body" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    for m in d.get('errorMessages', []): print('   ', m)
+    for k, v in d.get('errors', {}).items(): print(f'    {k}: {v}')
+except Exception:
+    pass
+" >&2
+    return 1
+  fi
+}
+
 _jr_json_comment_body() {
   python3 -c "
 import json, sys
@@ -114,7 +160,7 @@ for t in json.loads(sys.stdin.read()).get('transitions', []):
 " >&2; return 1 ;;
   esac
 
-  _jr_api POST "/issue/$ticket/transitions" "{\"transition\":{\"id\":\"$tid\"}}" > /dev/null
+  _jr_do_transition "$ticket" "$tid" "$status" || return 1
   echo "$ticket → $status"
 }
 
