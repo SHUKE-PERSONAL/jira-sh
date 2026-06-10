@@ -16,6 +16,21 @@ _jr_check_env() {
 
 _jr_resolve_ticket() {
   local t=$1
+  # Branch-derived ticket: empty / '.' / '@' means "the current branch's ticket".
+  # Extract (<PREFIX>)-<n> from the checked-out branch using JIRA_PROJECT_PREFIXES.
+  if [[ -z "$t" || "$t" == "." || "$t" == "@" ]]; then
+    local branch
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || {
+      echo "jr: not in a git repo; cannot derive ticket from the branch" >&2; return 1; }
+    local key
+    key=$(echo "$branch" | grep -oiE "(${JIRA_PROJECT_PREFIXES})-[0-9]+" | head -1)
+    if [[ -z "$key" ]]; then
+      echo "jr: no ticket key (${JIRA_PROJECT_PREFIXES}) found in branch '$branch'" >&2
+      return 1
+    fi
+    echo "$key" | tr '[:lower:]' '[:upper:]'
+    return 0
+  fi
   if [[ ! "$t" =~ ^[0-9]+$ ]]; then
     echo "$t"; return 0
   fi
@@ -366,9 +381,8 @@ cmd_resolve() {
     esac
   done
   set -- "${rest[@]}"
-  [[ $# -lt 1 ]] && { echo "Usage: jr resolve [--force] <TICKET>" >&2; return 1; }
   local ticket
-  ticket=$(_jr_resolve_ticket "$1") || return 1
+  ticket=$(_jr_resolve_ticket "${1:-.}") || return 1
 
   command -v gh >/dev/null 2>&1 || { echo "jr: gh CLI not found (needed to read the PR)" >&2; return 1; }
 
@@ -438,6 +452,235 @@ print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', '
         _jr_comment_write POST "/issue/$ticket/comment" "$body" \
           "failed to post Resolved comment to $ticket" || return 1
         echo "$ticket → Resolved comment added"
+        return 0 ;;
+    esac
+  done
+}
+
+# Build the filled "Merge Results" comment ADF (mirrors the workflow's orange
+# template). Values come from env: MR_REPO / MR_SRC / MR_TGT. "Was source branch
+# removed?" is Yes (we squash/merge with deleteBranchOnMerge); the CI cell stays
+# :question: (CI hasn't finished at merge time).
+_jr_merge_adf() {
+  MR_REPO="$1" MR_SRC="$2" MR_TGT="$3" python3 <<'PYEOF'
+import json, os
+FLAG = {"type": "emoji", "attrs": {"shortName": ":flag_on:", "id": "atlassian-flag_on", "text": ":flag_on:"}}
+Q = {"type": "emoji", "attrs": {"shortName": ":question:", "id": "atlassian-question_mark", "text": ":question:"}}
+
+repo = os.environ.get("MR_REPO", "")
+src  = os.environ.get("MR_SRC", "")
+tgt  = os.environ.get("MR_TGT", "")
+
+def header(text):
+    return {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": text, "marks": [{"type": "strong"}]}]}]}
+
+def cell_text(text):
+    if text:
+        return {"type": "tableCell", "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}]}
+    return {"type": "tableCell", "content": [{"type": "paragraph"}]}
+
+def cell_nodes(nodes):
+    return {"type": "tableCell", "content": [{"type": "paragraph", "content": nodes}]}
+
+table = {"type": "table", "attrs": {"isNumberColumnEnabled": False, "layout": "default"}, "content": [
+    {"type": "tableRow", "content": [
+        header("Repository"), header("Source branch"), header("Target branch"),
+        header("Was source branch removed?"), header("Target branch CI pipeline passed post merge?")]},
+    {"type": "tableRow", "content": [
+        cell_text(repo), cell_text(src), cell_text(tgt),
+        cell_text("Yes"), cell_nodes([Q])]},
+]}
+
+content = [
+    {"type": "heading", "attrs": {"level": 2},
+     "content": [FLAG, {"type": "text", "text": " Merge Results", "marks": [{"type": "textColor", "attrs": {"color": "#ffa500"}}]}]},
+    {"type": "heading", "attrs": {"level": 3}, "content": [{"type": "text", "text": "Details of merge"}]},
+    table,
+    {"type": "paragraph", "content": [{"type": "text", "text": "Action:", "marks": [{"type": "strong"}]}, {"type": "text", "text": " Ready to Test in Main"}]},
+]
+print(json.dumps({"body": {"type": "doc", "version": 1, "content": content}}))
+PYEOF
+}
+
+# Classify the "Merge Results" comments on a ticket. Reads the comment list on
+# stdin and my accountId as argv1; prints one of:
+#   TEMPLATE:<id>  unfilled template authored by me (data row carries no text yet)
+#   FILLED:<id>    a Merge Results comment I already filled in
+#   OTHER:<id>     a Merge Results comment authored by someone else (out of scope)
+#   NONE:          no Merge Results comment at all
+# Mine takes precedence over someone else's; an unfilled template over a filled one.
+_jr_merge_state() {
+  python3 -c "
+import json, sys
+me = sys.argv[1]
+
+def find_table(node):
+    if isinstance(node, dict):
+        if node.get('type') == 'table':
+            return node
+        for v in node.get('content', []):
+            r = find_table(v)
+            if r: return r
+    return None
+
+def count_text(node):
+    n = 0
+    if isinstance(node, dict):
+        if node.get('type') == 'text': n += 1
+        for v in node.get('content', []): n += count_text(v)
+    elif isinstance(node, list):
+        for v in node: n += count_text(v)
+    return n
+
+template = filled = other = None
+for c in json.load(sys.stdin).get('comments', []):
+    body = c.get('body', {})
+    s = json.dumps(body)
+    if 'atlassian-flag_on' not in s or 'Merge Results' not in s:
+        continue
+    if (c.get('author') or {}).get('accountId') != me:
+        other = c['id']; continue
+    tbl = find_table(body)
+    data_text = count_text(tbl['content'][1]) if tbl and len(tbl.get('content', [])) > 1 else 0
+    if data_text == 0:
+        template = c['id']
+    else:
+        filled = c['id']
+
+if template: print('TEMPLATE:' + template)
+elif filled: print('FILLED:' + filled)
+elif other:  print('OTHER:' + other)
+else:        print('NONE:')
+" "$1"
+}
+
+cmd_merge() {
+  local force=0 rest=()
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --force) force=1 ;;
+      *)       rest+=("$a") ;;
+    esac
+  done
+  set -- "${rest[@]}"
+  local ticket
+  ticket=$(_jr_resolve_ticket "${1:-.}") || return 1
+
+  command -v gh >/dev/null 2>&1 || { echo "jr: gh CLI not found (needed to read/merge the PR)" >&2; return 1; }
+
+  # PR for the current branch, with mergeability + authorship.
+  local pr
+  if ! pr=$(gh pr view --json number,state,mergeable,author,headRefName,baseRefName,headRepository 2>&1); then
+    echo "jr: no PR found for the current branch." >&2
+    echo "    Run from the repo with the feature branch checked out." >&2
+    echo "    If this repo needs a specific GitHub account, check gh / GH_PROFILE." >&2
+    echo "    gh: $pr" >&2
+    return 1
+  fi
+
+  local state mergeable number author head base repo
+  { read -r state; read -r mergeable; read -r number; read -r author; read -r head; read -r base; read -r repo; } < <(echo "$pr" | python3 -c "
+import json, sys
+p = json.load(sys.stdin)
+print(p.get('state') or '')
+print(p.get('mergeable') or '')
+print(p.get('number') or '')
+print((p.get('author') or {}).get('login') or '')
+print(p.get('headRefName') or '')
+print(p.get('baseRefName') or '')
+print((p.get('headRepository') or {}).get('name') or '')
+")
+
+  # Merge the PR (skip if already merged). Mergeability is mandatory: conflicts
+  # must be resolved and the PR re-approved by hand first — that's out of scope.
+  if [[ "$state" == "MERGED" ]]; then
+    echo "PR #$number already merged — skipping merge"
+  elif [[ "$state" != "OPEN" ]]; then
+    echo "jr: PR #$number is $state, not open; refusing to merge." >&2
+    return 1
+  else
+    if [[ "$mergeable" != "MERGEABLE" ]]; then
+      echo "jr: PR #$number is not mergeable (mergeable=$mergeable)." >&2
+      echo "    Resolve conflicts and get it re-approved, then retry." >&2
+      return 1
+    fi
+    # Method by authorship: mine → squash; someone else's → merge (keep their
+    # commits with the original author).
+    local me_gh method
+    me_gh=$(gh api user -q .login 2>/dev/null)
+    if [[ -n "$me_gh" && "$author" == "$me_gh" ]]; then
+      method=squash
+    else
+      method=merge
+    fi
+    echo "merging PR #$number via --$method (author: ${author:-?})…"
+    local out
+    if ! out=$(gh pr merge "$number" "--$method" 2>&1); then
+      echo "jr: failed to merge PR #$number" >&2
+      echo "    gh: $out" >&2
+      return 1
+    fi
+    echo "PR #$number merged (--$method)"
+  fi
+
+  # --- Jira side: move Merge → Test in Main, then fill the Merge Results template.
+  local me
+  me=$(_jr_api GET "/myself" | python3 -c "import json, sys; print(json.load(sys.stdin).get('accountId', ''))")
+  [[ -n "$me" ]] || { echo "jr: could not determine the current Jira user" >&2; return 1; }
+
+  local status
+  status=$(_jr_api GET "/issue/$ticket?fields=status" | python3 -c "
+import json, sys
+print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', ''))
+")
+  [[ -n "$status" ]] || { echo "jr: ticket not found: $ticket" >&2; return 1; }
+  if [[ "${status,,}" == *"test in main"* ]]; then
+    echo "$ticket already in '$status' — skipping move"
+  else
+    cmd_move "$ticket" "Test in Main" || return 1
+  fi
+
+  # Moving to Test in Main triggers the workflow's "Merge Results" template,
+  # authored by us; poll for it and PUT-fill the table. If the only template
+  # present was authored by someone else, they already drove this transition —
+  # out of jr merge's scope; leave it untouched.
+  local mbody
+  mbody=$(_jr_merge_adf "$repo" "$head" "$base") || return 1
+
+  local tries=10 mstate cid
+  while :; do
+    mstate=$(_jr_api GET "/issue/$ticket/comment" | _jr_merge_state "$me")
+    case "$mstate" in
+      TEMPLATE:*)
+        cid=${mstate#TEMPLATE:}
+        _jr_comment_write PUT "/issue/$ticket/comment/$cid" "$mbody" \
+          "failed to fill Merge Results comment $cid on $ticket" || return 1
+        echo "$ticket → Merge Results comment filled in (template $cid)"
+        return 0 ;;
+      FILLED:*)
+        cid=${mstate#FILLED:}
+        if [[ $force -eq 1 ]]; then
+          _jr_comment_write PUT "/issue/$ticket/comment/$cid" "$mbody" \
+            "failed to overwrite Merge Results comment $cid on $ticket" || return 1
+          echo "$ticket → Merge Results comment overwritten (--force, comment $cid)"
+          return 0
+        fi
+        echo "jr: $ticket already has a filled Merge Results comment ($cid); not overwriting." >&2
+        echo "    Re-run with --force to replace it." >&2
+        return 1 ;;
+      OTHER:*)
+        echo "jr: $ticket has a Merge Results comment authored by someone else — they already moved it on; out of scope, leaving it untouched."
+        return 0 ;;
+      *)
+        if [[ $tries -gt 0 ]]; then
+          [[ $tries -eq 10 ]] && echo "jr: waiting for the Merge Results template comment to appear…"
+          tries=$((tries - 1)); sleep 2; continue
+        fi
+        echo "jr: no template appeared; posting a new Merge Results comment instead"
+        _jr_comment_write POST "/issue/$ticket/comment" "$mbody" \
+          "failed to post Merge Results comment to $ticket" || return 1
+        echo "$ticket → Merge Results comment added"
         return 0 ;;
     esac
   done
@@ -523,11 +766,14 @@ Usage: jr <command> [args]
 Commands:
   move        <TICKET> <STATUS>   Transition a ticket to a new status
   comment     <TICKET> <TEXT>     Add a comment to a ticket
-  resolve     [--force] <TICKET>  Move to review, then fill the review template comment from the current branch's PR (--force overwrites a filled one)
+  resolve     [--force] [TICKET]  Move to review, then fill the review template comment from the current branch's PR (--force overwrites a filled one)
+  merge       [--force] [TICKET]  Merge the approved PR (squash if yours, merge otherwise), move Merge → Test in Main, then fill the Merge Results template
   transitions <TICKET>            List available transitions for a ticket
   assign      <TICKET> <NAME>     Assign ticket to a user (fuzzy name/email match)
   users       <TICKET> [query]    List assignable users for a ticket
   help                            Show this help
+
+A bare ., @, or an omitted TICKET derives the ticket from the current branch name.
 
 Required env vars:
   JIRA_BASE             https://yourcompany.atlassian.net
@@ -544,6 +790,7 @@ case "$cmd" in
   move|mv)        cmd_move        "$@" ;;
   comment)        cmd_comment     "$@" ;;
   resolve)        cmd_resolve     "$@" ;;
+  merge)          cmd_merge       "$@" ;;
   transitions)    cmd_transitions "$@" ;;
   assign)         cmd_assign      "$@" ;;
   users)          cmd_users       "$@" ;;
