@@ -174,6 +174,184 @@ cmd_comment() {
   echo "comment added to $ticket"
 }
 
+# Build the "Resolved" comment ADF from gh PR JSON ({body,url}) read from the
+# PR_JSON env var. Emits {"body": <doc>} on stdout. Exits 2 if mistune is
+# missing (with an install hint) so the caller can surface it.
+_jr_resolve_adf() {
+  PR_JSON="$1" python3 <<'PYEOF'
+import json, os, re, sys
+
+try:
+    import mistune
+except ImportError:
+    sys.stderr.write("jr: mistune is required to render the PR body into ADF.\n")
+    sys.stderr.write("    Install it with: pip install mistune\n")
+    sys.exit(2)
+
+try:
+    pr = json.loads(os.environ.get("PR_JSON", "") or "{}")
+except Exception as e:
+    sys.stderr.write("jr: could not parse PR JSON from gh: %s\n" % e)
+    sys.exit(1)
+
+body_md = (pr.get("body") or "").strip()
+url = pr.get("url") or ""
+
+# Drop the trailing "Generated with [Claude Code]" footer (and a dangling rule).
+kept = [ln for ln in body_md.split("\n") if "Generated with [Claude Code]" not in ln]
+body_md = re.sub(r"\n-{3,}\s*$", "", "\n".join(kept)).strip()
+
+FLAG = {"type": "emoji", "attrs": {"shortName": ":flag_on:", "id": "atlassian-flag_on", "text": ":flag_on:"}}
+Q = {"type": "emoji", "attrs": {"shortName": ":question:", "id": "atlassian-question_mark", "text": ":question:"}}
+
+def add_mark(nodes, mark):
+    for n in nodes:
+        if n.get("type") == "text":
+            n.setdefault("marks", []).append(mark)
+    return nodes
+
+def inline(children):
+    out = []
+    for tok in children or []:
+        t = tok.get("type")
+        if t == "text":
+            if tok.get("raw"):
+                out.append({"type": "text", "text": tok["raw"]})
+        elif t == "codespan":
+            if tok.get("raw"):
+                out.append({"type": "text", "text": tok["raw"], "marks": [{"type": "code"}]})
+        elif t == "link":
+            href = (tok.get("attrs") or {}).get("url", "")
+            kids = inline(tok.get("children", [])) or ([{"type": "text", "text": href}] if href else [])
+            out.extend(add_mark(kids, {"type": "link", "attrs": {"href": href}}))
+        elif t == "strong":
+            out.extend(add_mark(inline(tok.get("children", [])), {"type": "strong"}))
+        elif t == "emphasis":
+            out.extend(add_mark(inline(tok.get("children", [])), {"type": "em"}))
+        elif t == "linebreak":
+            out.append({"type": "hardBreak"})
+        elif t == "softbreak":
+            out.append({"type": "text", "text": " "})
+        elif tok.get("raw"):
+            out.append({"type": "text", "text": tok["raw"]})
+    return out
+
+def para(children):
+    p = {"type": "paragraph"}
+    c = inline(children)
+    if c:
+        p["content"] = c
+    return p
+
+def blocks(tokens):
+    out = []
+    for tok in tokens or []:
+        t = tok.get("type")
+        if t == "blank_line":
+            continue
+        elif t == "heading":
+            # Demote below our level-2 section labels.
+            lvl = min(6, (tok.get("attrs") or {}).get("level", 1) + 2)
+            c = inline(tok.get("children", []))
+            if c:
+                out.append({"type": "heading", "attrs": {"level": lvl}, "content": c})
+        elif t in ("paragraph", "block_text"):
+            out.append(para(tok.get("children", [])))
+        elif t == "block_quote":
+            inner = blocks(tok.get("children", [])) or [{"type": "paragraph"}]
+            out.append({"type": "blockquote", "content": inner})
+        elif t == "list":
+            ordered = (tok.get("attrs") or {}).get("ordered", False)
+            items = []
+            for li in tok.get("children", []):
+                inner = blocks(li.get("children", [])) or [{"type": "paragraph"}]
+                items.append({"type": "listItem", "content": inner})
+            if items:
+                out.append({"type": "orderedList" if ordered else "bulletList", "content": items})
+        elif t == "thematic_break":
+            out.append({"type": "rule"})
+        elif tok.get("raw"):
+            # Unknown token (tables, fenced code, images): degrade to raw text.
+            out.append({"type": "paragraph", "content": [{"type": "text", "text": tok["raw"]}]})
+    return out
+
+md = mistune.create_markdown(renderer=None)
+summary = blocks(md(body_md)) if body_md else []
+if not summary:
+    summary = [{"type": "paragraph", "content": [{"type": "text", "text": "(no PR description)"}]}]
+
+def label(text):
+    return {"type": "paragraph", "content": [{"type": "text", "text": text, "marks": [{"type": "strong"}]}]}
+
+def bullet(nodes):
+    return {"type": "bulletList", "content": [{"type": "listItem", "content": [{"type": "paragraph", "content": nodes}]}]}
+
+CHECKLIST = [
+    "DDT script run using DFXDDT (DeployDFXDDT) & in correct folder - ",
+    "Infrastructure Release Notes written - ",
+    "API: Source code comments for interface changes - ",
+    "Privacy concerns resolved - ",
+]
+checklist = [{"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text", "text": it}, Q]}]} for it in CHECKLIST]
+
+pr_link = [{"type": "text", "text": url, "marks": [{"type": "link", "attrs": {"href": url}}]}] if url else [{"type": "text", "text": "(no PR link)"}]
+
+content = [{"type": "heading", "attrs": {"level": 2},
+            "content": [FLAG, {"type": "text", "text": " Resolved", "marks": [{"type": "textColor", "attrs": {"color": "#3cb371"}}]}]},
+           label("Summary of code changes")]
+content += summary
+content += [label("Details of dev testing"), bullet([{"type": "text", "text": "Unit tests all pass"}]),
+            label("Components changed (and feature branch if applicable)"), bullet(pr_link),
+            label("Checklist"), {"type": "bulletList", "content": checklist}]
+
+print(json.dumps({"body": {"type": "doc", "version": 1, "content": content}}))
+PYEOF
+}
+
+cmd_resolve() {
+  [[ $# -lt 1 ]] && { echo "Usage: jr resolve <TICKET>" >&2; return 1; }
+  local ticket
+  ticket=$(_jr_resolve_ticket "$1") || return 1
+
+  command -v gh >/dev/null 2>&1 || { echo "jr: gh CLI not found (needed to read the PR)" >&2; return 1; }
+
+  # PR for the current branch.
+  local pr
+  if ! pr=$(gh pr view --json body,url 2>&1); then
+    echo "jr: no PR found for the current branch." >&2
+    echo "    Run from the repo with the feature branch checked out." >&2
+    echo "    If this repo needs a specific GitHub account, check gh / GH_PROFILE." >&2
+    echo "    gh: $pr" >&2
+    return 1
+  fi
+
+  # Build the Resolved comment from the PR data (mistune renders the body).
+  local body
+  body=$(_jr_resolve_adf "$pr") || return 1
+
+  # Post it, reporting real failures (no silent success).
+  local resp code errbody
+  resp=$(_jr_api_status POST "/issue/$ticket/comment" "$body")
+  code=${resp##*$'\n'}; errbody=${resp%$'\n'*}
+  if [[ ! "$code" =~ ^2 ]]; then
+    echo "jr: failed to post Resolved comment to $ticket (HTTP $code)" >&2
+    echo "$errbody" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    for m in d.get('errorMessages', []): print('   ', m)
+    for k, v in d.get('errors', {}).items(): print(f'    {k}: {v}')
+except Exception:
+    pass
+" >&2
+    return 1
+  fi
+  echo "Resolved comment added to $ticket"
+
+  # Move to review, reusing cmd_move (Time Spent validator handling included).
+  cmd_move "$ticket" "review"
+}
+
 cmd_transitions() {
   [[ $# -lt 1 ]] && { echo "Usage: jr transitions <TICKET>" >&2; return 1; }
   local ticket
@@ -254,6 +432,7 @@ Usage: jr <command> [args]
 Commands:
   move        <TICKET> <STATUS>   Transition a ticket to a new status
   comment     <TICKET> <TEXT>     Add a comment to a ticket
+  resolve     <TICKET>            Post a Resolved comment built from the current branch's PR, then move to review
   transitions <TICKET>            List available transitions for a ticket
   assign      <TICKET> <NAME>     Assign ticket to a user (fuzzy name/email match)
   users       <TICKET> [query]    List assignable users for a ticket
@@ -273,6 +452,7 @@ shift 2>/dev/null || true
 case "$cmd" in
   move|mv)        cmd_move        "$@" ;;
   comment)        cmd_comment     "$@" ;;
+  resolve)        cmd_resolve     "$@" ;;
   transitions)    cmd_transitions "$@" ;;
   assign)         cmd_assign      "$@" ;;
   users)          cmd_users       "$@" ;;
