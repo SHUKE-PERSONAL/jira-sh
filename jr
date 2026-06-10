@@ -308,8 +308,65 @@ print(json.dumps({"body": {"type": "doc", "version": 1, "content": content}}))
 PYEOF
 }
 
+# POST/PUT a comment body, reporting non-2xx with the server's error messages.
+#   _jr_comment_write POST /issue/K/comment        "$body" "what failed"
+#   _jr_comment_write PUT  /issue/K/comment/<id>   "$body" "what failed"
+_jr_comment_write() {
+  local method=$1 path=$2 body=$3 what=$4
+  local resp code errbody
+  resp=$(_jr_api_status "$method" "$path" "$body")
+  code=${resp##*$'\n'}; errbody=${resp%$'\n'*}
+  if [[ ! "$code" =~ ^2 ]]; then
+    echo "jr: $what (HTTP $code)" >&2
+    echo "$errbody" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    for m in d.get('errorMessages', []): print('   ', m)
+    for k, v in d.get('errors', {}).items(): print(f'    {k}: {v}')
+except Exception:
+    pass
+" >&2
+    return 1
+  fi
+}
+
+# Classify my Resolved comments on a ticket. Reads the comment list on stdin and
+# my accountId as argv1; prints one of:
+#   TEMPLATE:<id>  an unfilled auto-generated template (has <summary>/<details>/<component>)
+#   FILLED:<id>    a Resolved comment already filled in (placeholders gone)
+#   NONE:          no Resolved comment authored by me
+# A template takes precedence over a filled one if both exist.
+_jr_resolved_state() {
+  python3 -c "
+import json, sys
+me = sys.argv[1]
+template = filled = None
+for c in json.load(sys.stdin).get('comments', []):
+    if (c.get('author') or {}).get('accountId') != me:
+        continue
+    body = json.dumps(c.get('body', {}))
+    if 'atlassian-flag_on' not in body:
+        continue
+    if any(t in body for t in ('<summary>', '<details>', '<component>')):
+        template = c['id']
+    else:
+        filled = c['id']
+print('TEMPLATE:' + template if template else ('FILLED:' + filled if filled else 'NONE:'))
+" "$1"
+}
+
 cmd_resolve() {
-  [[ $# -lt 1 ]] && { echo "Usage: jr resolve <TICKET>" >&2; return 1; }
+  local force=0 rest=()
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --force) force=1 ;;
+      *)       rest+=("$a") ;;
+    esac
+  done
+  set -- "${rest[@]}"
+  [[ $# -lt 1 ]] && { echo "Usage: jr resolve [--force] <TICKET>" >&2; return 1; }
   local ticket
   ticket=$(_jr_resolve_ticket "$1") || return 1
 
@@ -329,27 +386,61 @@ cmd_resolve() {
   local body
   body=$(_jr_resolve_adf "$pr") || return 1
 
-  # Post it, reporting real failures (no silent success).
-  local resp code errbody
-  resp=$(_jr_api_status POST "/issue/$ticket/comment" "$body")
-  code=${resp##*$'\n'}; errbody=${resp%$'\n'*}
-  if [[ ! "$code" =~ ^2 ]]; then
-    echo "jr: failed to post Resolved comment to $ticket (HTTP $code)" >&2
-    echo "$errbody" | python3 -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    for m in d.get('errorMessages', []): print('   ', m)
-    for k, v in d.get('errors', {}).items(): print(f'    {k}: {v}')
-except Exception:
-    pass
-" >&2
-    return 1
-  fi
-  echo "Resolved comment added to $ticket"
+  local me
+  me=$(_jr_api GET "/myself" | python3 -c "import json, sys; print(json.load(sys.stdin).get('accountId', ''))")
+  [[ -n "$me" ]] || { echo "jr: could not determine the current Jira user" >&2; return 1; }
 
-  # Move to review, reusing cmd_move (Time Spent validator handling included).
-  cmd_move "$ticket" "review"
+  # Move to review first — unless the user already moved it there by hand.
+  local status
+  status=$(_jr_api GET "/issue/$ticket?fields=status" | python3 -c "
+import json, sys
+print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', ''))
+")
+  [[ -n "$status" ]] || { echo "jr: ticket not found: $ticket" >&2; return 1; }
+  if [[ "${status,,}" == *review* ]]; then
+    echo "$ticket already in '$status' — skipping move"
+  else
+    cmd_move "$ticket" "review" || return 1
+  fi
+
+  # Find (and, if needed, wait for) the review template comment, then fill it in.
+  # Moving to review triggers the workflow's auto-template, which can lag a few
+  # seconds; poll for it. If a filled Resolved comment already exists, don't
+  # clobber it unless --force.
+  local tries=10 state cid
+  while :; do
+    state=$(_jr_api GET "/issue/$ticket/comment" | _jr_resolved_state "$me")
+    case "$state" in
+      TEMPLATE:*)
+        cid=${state#TEMPLATE:}
+        _jr_comment_write PUT "/issue/$ticket/comment/$cid" "$body" \
+          "failed to update Resolved comment $cid on $ticket" || return 1
+        echo "$ticket → Resolved comment filled in (replaced template $cid)"
+        return 0 ;;
+      FILLED:*)
+        cid=${state#FILLED:}
+        if [[ $force -eq 1 ]]; then
+          _jr_comment_write PUT "/issue/$ticket/comment/$cid" "$body" \
+            "failed to overwrite Resolved comment $cid on $ticket" || return 1
+          echo "$ticket → Resolved comment overwritten (--force, comment $cid)"
+          return 0
+        fi
+        echo "jr: $ticket already has a filled Resolved comment ($cid); not overwriting." >&2
+        echo "    Re-run with --force to replace it." >&2
+        return 1 ;;
+      *)
+        if [[ $tries -gt 0 ]]; then
+          [[ $tries -eq 10 ]] && echo "jr: waiting for the review template comment to appear…"
+          tries=$((tries - 1)); sleep 2; continue
+        fi
+        # Automation didn't produce a template (disabled/slow): post a fresh one.
+        echo "jr: no template appeared; posting a new Resolved comment instead"
+        _jr_comment_write POST "/issue/$ticket/comment" "$body" \
+          "failed to post Resolved comment to $ticket" || return 1
+        echo "$ticket → Resolved comment added"
+        return 0 ;;
+    esac
+  done
 }
 
 cmd_transitions() {
@@ -432,7 +523,7 @@ Usage: jr <command> [args]
 Commands:
   move        <TICKET> <STATUS>   Transition a ticket to a new status
   comment     <TICKET> <TEXT>     Add a comment to a ticket
-  resolve     <TICKET>            Post a Resolved comment built from the current branch's PR, then move to review
+  resolve     [--force] <TICKET>  Move to review, then fill the review template comment from the current branch's PR (--force overwrites a filled one)
   transitions <TICKET>            List available transitions for a ticket
   assign      <TICKET> <NAME>     Assign ticket to a user (fuzzy name/email match)
   users       <TICKET> [query]    List assignable users for a ticket
