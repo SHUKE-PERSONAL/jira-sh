@@ -759,6 +759,133 @@ else:
   esac
 }
 
+cmd_view() {
+  [[ $# -lt 1 && -z "${1:-}" ]] && set -- "."
+  local ticket
+  ticket=$(_jr_resolve_ticket "${1:-.}") || return 1
+
+  local issue
+  issue=$(_jr_api GET "/issue/$ticket?fields=summary,status,issuetype,priority,assignee,reporter,labels,description") || {
+    echo "jr: ticket not found: $ticket" >&2; return 1; }
+
+  echo "$issue" | JIRA_BASE="$JIRA_BASE" KEY="$ticket" python3 -c "$(cat <<'PYEOF'
+import json, os, sys
+
+issue = json.load(sys.stdin)
+f = issue.get('fields', {}) or {}
+key = os.environ.get('KEY') or issue.get('key', '')
+base = (os.environ.get('JIRA_BASE') or '').rstrip('/')
+
+def fv(d, *path):
+    for p in path:
+        d = d.get(p) if isinstance(d, dict) else None
+    return d
+
+status   = fv(f, 'status', 'name') or ''
+summary  = f.get('summary') or ''
+itype    = fv(f, 'issuetype', 'name') or ''
+prio     = fv(f, 'priority', 'name') or ''
+assignee = fv(f, 'assignee', 'displayName') or 'Unassigned'
+reporter = fv(f, 'reporter', 'displayName') or ''
+labels   = f.get('labels') or []
+
+# ---- ADF -> readable markdown ----
+def wrap(text, marks):
+    for m in marks or []:
+        t = m.get('type')
+        if   t == 'code':   text = '`%s`' % text
+        elif t == 'strong': text = '**%s**' % text
+        elif t == 'em':     text = '*%s*' % text
+        elif t == 'strike': text = '~~%s~~' % text
+        elif t == 'link':   text = '[%s](%s)' % (text, (m.get('attrs') or {}).get('href', ''))
+    return text
+
+def inline(nodes):
+    out = ''
+    for n in nodes or []:
+        t = n.get('type')
+        a = n.get('attrs') or {}
+        if   t == 'text':       out += wrap(n.get('text', ''), n.get('marks'))
+        elif t == 'hardBreak':  out += '\n'
+        elif t == 'emoji':      out += a.get('text') or a.get('shortName', '')
+        elif t == 'mention':    out += '@' + (a.get('text') or '').lstrip('@')
+        elif t == 'inlineCard': out += a.get('url', '')
+        elif t == 'status':     out += '[%s]' % a.get('text', '')
+        elif t == 'date':       out += a.get('timestamp', '')
+        elif 'content' in n:    out += inline(n['content'])
+    return out
+
+def block(nodes, indent=0):
+    lines = []
+    pad = '  ' * indent
+    for n in nodes or []:
+        t = n.get('type')
+        a = n.get('attrs') or {}
+        if t == 'paragraph':
+            lines.append(pad + inline(n.get('content')))
+        elif t == 'heading':
+            lines.append(pad + '#' * a.get('level', 1) + ' ' + inline(n.get('content')))
+        elif t in ('bulletList', 'orderedList'):
+            ordered = t == 'orderedList'
+            for i, li in enumerate(n.get('content', []), 1):
+                inner = block(li.get('content', []), indent + 1)
+                marker = ('%d.' % i) if ordered else '-'
+                pos = next((k for k, l in enumerate(inner) if l.strip()), None)
+                if pos is None:
+                    inner = [pad + marker + ' ']
+                else:
+                    inner[pos] = pad + marker + ' ' + inner[pos].lstrip()
+                lines += inner
+        elif t == 'taskList':
+            for ti in n.get('content', []):
+                box = '[x]' if (ti.get('attrs') or {}).get('state') == 'DONE' else '[ ]'
+                lines.append(pad + '- ' + box + ' ' + inline(ti.get('content')))
+        elif t == 'codeBlock':
+            lines.append(pad + '```' + (a.get('language') or ''))
+            lines.append(inline(n.get('content')))
+            lines.append(pad + '```')
+        elif t == 'blockquote':
+            for l in block(n.get('content', []), indent):
+                lines.append((pad + '> ' + l) if l else (pad + '>'))
+        elif t == 'rule':
+            lines.append(pad + '---')
+        elif t == 'panel':
+            lines.append(pad + '[%s]' % (a.get('panelType') or 'note'))
+            lines += block(n.get('content', []), indent)
+        elif t == 'table':
+            for row in n.get('content', []):
+                cells = []
+                for cell in row.get('content', []):
+                    cells.append(' '.join(block(cell.get('content', []))).replace('\n', ' ').strip())
+                lines.append(pad + '| ' + ' | '.join(cells) + ' |')
+        elif t in ('mediaSingle', 'mediaGroup', 'media'):
+            lines.append(pad + '[media]')
+        elif 'content' in n:
+            lines += block(n['content'], indent)
+    return lines
+
+print('%s  %s' % (key, status))
+print('  Summary   %s' % summary)
+l = '  Type      %s' % itype
+if prio:     l += '    Priority  %s' % prio
+print(l)
+l = '  Assignee  %s' % assignee
+if reporter: l += '    Reporter  %s' % reporter
+print(l)
+if labels:   print('  Labels    %s' % ', '.join(labels))
+print('  URL       %s/browse/%s' % (base, key))
+print()
+print('Description')
+desc = f.get('description')
+if isinstance(desc, dict) and desc.get('content'):
+    text = '\n'.join(block(desc['content'])).strip('\n')
+    print(text if text.strip() else '  (empty)')
+else:
+    print('  (no description)')
+PYEOF
+)"
+}
+
 cmd_help() {
   cat <<'EOF'
 Usage: jr <command> [args]
@@ -768,6 +895,7 @@ Commands:
   comment     <TICKET> <TEXT>     Add a comment to a ticket
   resolve     [--force] [TICKET]  Move to review, then fill the review template comment from the current branch's PR (--force overwrites a filled one)
   merge       [--force] [TICKET]  Merge the approved PR (squash if yours, merge otherwise), move Merge → Test in Main, then fill the Merge Results template
+  view        [TICKET]            Show a ticket's fields and full description (rendered) — enough to understand the task + A/C
   transitions <TICKET>            List available transitions for a ticket
   assign      <TICKET> <NAME>     Assign ticket to a user (fuzzy name/email match)
   users       <TICKET> [query]    List assignable users for a ticket
@@ -791,6 +919,7 @@ case "$cmd" in
   comment)        cmd_comment     "$@" ;;
   resolve)        cmd_resolve     "$@" ;;
   merge)          cmd_merge       "$@" ;;
+  view)           cmd_view        "$@" ;;
   transitions)    cmd_transitions "$@" ;;
   assign)         cmd_assign      "$@" ;;
   users)          cmd_users       "$@" ;;
