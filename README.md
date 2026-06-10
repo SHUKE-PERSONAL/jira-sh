@@ -32,4 +32,17 @@ jr help
 
 - bash
 - curl
-- python3 (stdlib only)
+- python3
+
+Core commands (`move`, `comment`, `transitions`, `assign`, `users`) use the
+Python standard library only.
+
+The `jr resolve` command additionally needs:
+
+- [`gh`](https://cli.github.com/) — the GitHub CLI, authenticated for the repo's
+  owner. If you use a multi-account `gh` wrapper that routes by repo owner, make
+  sure the right account is selected (e.g. `GH_PROFILE=work`), or `gh pr view`
+  will 404 on private org repos.
+- [`mistune`](https://pypi.org/project/mistune/) — renders the PR description
+  (Markdown) into Jira's ADF format. Install with `pip install mistune`. If it's
+  missing, `jr resolve` exits with a hint rather than posting raw Markdown.
