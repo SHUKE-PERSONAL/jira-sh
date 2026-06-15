@@ -875,12 +875,24 @@ else:        print('NONE:')
 
 cmd_approve() {
   local force=0 keep_sql=1 keep_jenkins=1 rest=()
-  local a
+  local a opt c i
   for a in "$@"; do
     case "$a" in
       --force)      force=1 ;;
       --no-sql)     keep_sql=0 ;;
       --no-jenkins) keep_jenkins=0 ;;
+      # Bundled short flags: -s skip SQL, -j skip Jenkins, -f force (e.g. -sj, -sjf).
+      -[sjf]*)
+        opt=${a#-}
+        for (( i=0; i<${#opt}; i++ )); do
+          c=${opt:i:1}
+          case "$c" in
+            s) keep_sql=0 ;;
+            j) keep_jenkins=0 ;;
+            f) force=1 ;;
+            *) echo "jr: unknown option -$c (in '$a')" >&2; return 1 ;;
+          esac
+        done ;;
       *)            rest+=("$a") ;;
     esac
   done
@@ -1176,6 +1188,7 @@ Commands:
   approve     [--force] [--no-sql] [--no-jenkins] [TICKET]
                                   Finish review: move Review → Test in Branch, then fill the Code Review Checklist (tick Done, keep first 3 + last row, Action: Ready for test).
                                   --no-sql / --no-jenkins drop the SQL / Jenkins rows for tickets with no SQL changes or projects with no Jenkins pipeline.
+                                  Short forms bundle: -s (no-sql), -j (no-jenkins), -f (force) — e.g. -sj skips both, -sjf also overwrites.
   merge       [--force] [TICKET]  Merge the approved PR (squash if yours, merge otherwise), move Merge → Test in Main, then fill the Merge Results template
   view        [TICKET]            Show a ticket's fields and full description (rendered) — enough to understand the task + A/C
   transitions <TICKET>            List available transitions for a ticket
