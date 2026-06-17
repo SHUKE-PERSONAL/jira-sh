@@ -146,9 +146,10 @@ except Exception:
     local capex_answer capex_value
     read -r -p "CapEx? [y/N]: " capex_answer
     capex_value=$( [[ "${capex_answer,,}" == "y" ]] && echo "$capex_yes" || echo "$capex_no" )
-    _jr_api PATCH "/issue/$ticket" "{\"fields\":{\"$capex_field\":{\"value\":\"$capex_value\"}}}" > /dev/null \
-      || { echo "jr: failed to set CapEx field on $ticket" >&2; return 1; }
-    resp=$(_jr_api_status POST "/issue/$ticket/transitions" "{\"transition\":{\"id\":\"$tid\"}}")
+    # CapEx lives on the transition screen, not the edit screen — include it in
+    # the transition body's fields rather than PATCHing the issue separately.
+    resp=$(_jr_api_status POST "/issue/$ticket/transitions" \
+      "{\"transition\":{\"id\":\"$tid\"},\"fields\":{\"$capex_field\":{\"value\":\"$capex_value\"}}}")
     code=${resp##*$'\n'}; body=${resp%$'\n'*}
   fi
   if [[ ! "$code" =~ ^2 ]]; then
@@ -2021,10 +2022,12 @@ Commands:
   open        [-p] [TICKET]       Open ticket in the browser (-p / --print to only echo the URL)
   view        [TICKET]            Show a ticket's fields and full description (rendered) — enough to understand the task + A/C
   set-field   <TICKET> <FIELD> <VALUE|--list-options>
-                                Set a custom field on a ticket. FIELD accepts a customfield_XXXXX ID
-                                or a case-insensitive name (e.g. CapEx). VALUE is the option label
-                                for select fields, a number, or raw JSON ({…}). Use --list-options
-                                to discover allowed values for a select field.
+                                Set a custom field on a ticket via the Edit screen. FIELD accepts a
+                                customfield_XXXXX ID or a case-insensitive name (e.g. Priority).
+                                VALUE is the option label for select fields, a number, or raw JSON
+                                ({…}). Use --list-options to discover allowed values. Note: fields
+                                that only appear on transition screens (e.g. CapEx) cannot be set
+                                this way — jr move handles those automatically via transition fields.
   transitions <TICKET>            List available transitions for a ticket
   assign      <TICKET> [NAME]     Assign ticket to a user (fuzzy name/email match); NAME omitted = assign to yourself
   users       <TICKET> [query]    List assignable users for a ticket
