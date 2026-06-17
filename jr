@@ -1324,17 +1324,18 @@ PYEOF
 }
 
 cmd_edit() {
-  local title="" body="" body_file="" dry_run=0 ticket_arg=""
+  local title="" body="" body_file="" dry_run=0 force=0 ticket_arg=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --title)     title=$2;     shift 2 ;;
-      --body)      body=$2;      shift 2 ;;
-      --body-file) body_file=$2; shift 2 ;;
-      --dry-run)   dry_run=1;    shift ;;
+      --title)        title=$2;     shift 2 ;;
+      --body)         body=$2;      shift 2 ;;
+      --body-file)    body_file=$2; shift 2 ;;
+      --dry-run)      dry_run=1;    shift ;;
+      --force|-f)     force=1;      shift ;;
       -*)
         echo "jr edit: unknown flag '$1'" >&2
-        echo "Usage: jr edit [TICKET] [--title \"...\"] [--body \"...\"|--body-file path] [--dry-run]" >&2
+        echo "Usage: jr edit [TICKET] [--title \"...\"] [--body \"...\"|--body-file path] [--force] [--dry-run]" >&2
         return 1 ;;
       *)  ticket_arg=$1; shift ;;
     esac
@@ -1357,6 +1358,7 @@ cmd_edit() {
   JR_TITLE="$title" \
   JR_BODY="$body" \
   JR_DRY_RUN="$dry_run" \
+  JR_FORCE="$force" \
   python3 <<'PYEOF'
 import json, os, subprocess, sys
 
@@ -1364,6 +1366,7 @@ ticket  = os.environ["JR_TICKET"]
 title   = os.environ.get("JR_TITLE", "")
 body_md = os.environ.get("JR_BODY", "")
 dry_run = os.environ.get("JR_DRY_RUN") == "1"
+force   = os.environ.get("JR_FORCE")   == "1"
 
 base_url = os.environ["JIRA_BASE"].rstrip("/")
 email    = os.environ["JIRA_EMAIL"]
@@ -1396,8 +1399,8 @@ reporter_name = (issue.get("fields") or {}).get("reporter", {}).get("displayName
 me            = api_get("/myself")
 me_id         = me.get("accountId", "")
 
-if reporter_id != me_id:
-    sys.stderr.write(f"jr: {ticket} was reported by {reporter_name} -- only the reporter can edit it\n")
+if reporter_id != me_id and not force:
+    sys.stderr.write(f"jr: {ticket} was reported by {reporter_name} -- use --force to edit anyway\n")
     sys.exit(1)
 
 # ── Markdown → ADF ────────────────────────────────────────────────────────────
@@ -1540,8 +1543,8 @@ Commands:
   merge       [--force] [TICKET]  Merge the approved PR (squash if yours, merge otherwise), move Merge → Test in Main, then fill the Merge Results template
   create      --title "..." [--body "..." | --body-file path] [--priority P] [--points N] [--type T] [--epic KEY] [--no-sprint] [--dry-run]
                                   Create a new ticket (defaults from ~/.jr.toml; --dry-run prints the JSON payload without creating)
-  edit        [TICKET] [--title "..."] [--body "..." | --body-file path] [--dry-run]
-                                  Update the title and/or body of a ticket you reported (reporter-only guard)
+  edit        [TICKET] [--title "..."] [--body "..." | --body-file path] [--force] [--dry-run]
+                                  Update the title and/or body of a ticket you reported; --force/-f edits any ticket
   view        [TICKET]            Show a ticket's fields and full description (rendered) — enough to understand the task + A/C
   transitions <TICKET>            List available transitions for a ticket
   assign      <TICKET> [NAME]     Assign ticket to a user (fuzzy name/email match); NAME omitted = assign to yourself
