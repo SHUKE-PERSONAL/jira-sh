@@ -100,6 +100,8 @@ _jr_api_status() {
 # POST a transition, reporting real failures. Some transitions enforce a
 # "Time Spent" validator; we then prompt for the time to log (Jira's documented
 # bypass is 0m, which is the default if you just press Enter).
+# Transitions to "Ready" may also require a CapEx field; configure it in
+# ~/.jr.toml under [move.capex] with field, yes_value, and no_value keys.
 _jr_do_transition() {
   local ticket=$1 tid=$2 status=$3
   local resp code body
@@ -111,6 +113,42 @@ _jr_do_transition() {
     spent=${spent:-0m}
     resp=$(_jr_api_status POST "/issue/$ticket/transitions" \
       "{\"transition\":{\"id\":\"$tid\"},\"update\":{\"worklog\":[{\"add\":{\"timeSpent\":\"$spent\"}}]}}")
+    code=${resp##*$'\n'}; body=${resp%$'\n'*}
+  fi
+  if [[ ! "$code" =~ ^2 ]] && echo "$body" | grep -qi "capex"; then
+    local capex_field capex_yes capex_no
+    { read -r capex_field; read -r capex_yes; read -r capex_no; } < <(python3 -c "
+import os, sys
+try:
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib
+    with open(os.path.expanduser('~/.jr.toml'), 'rb') as f:
+        cfg = tomllib.load(f)
+    cap = cfg.get('move', {}).get('capex', {})
+    print(cap.get('field', ''))
+    print(cap.get('yes_value', 'Yes'))
+    print(cap.get('no_value', 'No'))
+except Exception:
+    print('')
+    print('Yes')
+    print('No')
+")
+    if [[ -z "$capex_field" ]]; then
+      echo "jr: '$status' requires a CapEx field. Add to ~/.jr.toml:" >&2
+      echo "    [move.capex]" >&2
+      echo "    field     = \"customfield_XXXXX\"  # CapEx custom field ID" >&2
+      echo "    yes_value = \"Yes\"                # optional, default Yes" >&2
+      echo "    no_value  = \"No\"                 # optional, default No" >&2
+      return 1
+    fi
+    local capex_answer capex_value
+    read -r -p "CapEx? [y/N]: " capex_answer
+    capex_value=$( [[ "${capex_answer,,}" == "y" ]] && echo "$capex_yes" || echo "$capex_no" )
+    _jr_api PATCH "/issue/$ticket" "{\"fields\":{\"$capex_field\":{\"value\":\"$capex_value\"}}}" > /dev/null \
+      || { echo "jr: failed to set CapEx field on $ticket" >&2; return 1; }
+    resp=$(_jr_api_status POST "/issue/$ticket/transitions" "{\"transition\":{\"id\":\"$tid\"}}")
     code=${resp##*$'\n'}; body=${resp%$'\n'*}
   fi
   if [[ ! "$code" =~ ^2 ]]; then
@@ -1894,6 +1932,12 @@ Required env vars:
   JIRA_EMAIL            your@email.com
   JIRA_TOKEN            your-api-token
   JIRA_PROJECT_PREFIXES pipe-separated project keys (default: MT|DOS)
+
+Optional ~/.jr.toml sections:
+  [move.capex]          Required if your workflow enforces a CapEx field on the
+                        Ready transition. Set field to the Jira custom field ID
+                        (e.g. customfield_12345). yes_value/no_value default to
+                        "Yes"/"No" if omitted.
 EOF
 }
 

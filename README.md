@@ -81,6 +81,25 @@ jr approve -sj          # short forms bundle: -s (no-sql) -j (no-jenkins) -f (fo
 jr approve -sjf MT-63504 # skip both rows and overwrite a filled checklist
 ```
 
+## Transition validators
+
+Some workflow transitions enforce required fields. `jr move` handles two
+automatically:
+
+**Time Spent** — if Jira rejects the transition with a "time spent" error, jr
+prompts for a duration (e.g. `30m`, `1h`). Press Enter to submit `0m`.
+
+**CapEx** — if Jira rejects a transition (commonly `→ Ready`) because a CapEx
+field is missing, jr prompts `CapEx? [y/N]` and patches the field before
+retrying. Requires `[move.capex]` in `~/.jr.toml`:
+
+```toml
+[move.capex]
+field     = "customfield_XXXXX"   # Jira custom field ID for CapEx
+yes_value = "Yes"                 # option label when CapEx (default: Yes)
+no_value  = "No"                  # option label when not CapEx (default: No)
+```
+
 ## Requirements
 
 - bash
