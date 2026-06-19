@@ -518,10 +518,35 @@ def blocks(tokens):
             out.append({"type": "paragraph", "content": [{"type": "text", "text": tok["raw"]}]})
     return out
 
+def list_items(tokens):
+    """Collect every list's items into a flat sequence of ADF listItems.
+    Headings, prose, code blocks and test plans are dropped — the Team Leader
+    wants a short list of changes, not the whole PR body."""
+    items = []
+    for tok in tokens or []:
+        if tok.get("type") == "list":
+            for li in tok.get("children", []):
+                inner = blocks(li.get("children", [])) or [{"type": "paragraph"}]
+                items.append({"type": "listItem", "content": inner})
+        elif tok.get("children"):
+            items.extend(list_items(tok.get("children", [])))
+    return items
+
 md = mistune.create_markdown(renderer=None)
-summary = blocks(md(body_md)) if body_md else []
-if not summary:
-    summary = [{"type": "paragraph", "content": [{"type": "text", "text": "(no PR description)"}]}]
+items = list_items(md(body_md)) if body_md else []
+
+# Fallback: no bullets in the PR body — list the commit subjects instead.
+if not items:
+    for c in pr.get("commits") or []:
+        h = (c.get("messageHeadline") or "").strip()
+        if h:
+            items.append({"type": "listItem", "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": h}]}]})
+
+if items:
+    summary = [{"type": "bulletList", "content": items}]
+else:
+    summary = [{"type": "paragraph", "content": [{"type": "text", "text": "(no summary)"}]}]
 
 def label(text):
     return {"type": "paragraph", "content": [{"type": "text", "text": text, "marks": [{"type": "strong"}]}]}
@@ -655,7 +680,7 @@ cmd_resolve() {
 
   # PR for the current branch.
   local pr
-  if ! pr=$(gh pr view --json body,url 2>&1); then
+  if ! pr=$(gh pr view --json body,url,commits 2>&1); then
     echo "jr: no PR found for the current branch." >&2
     echo "    Run from the repo with the feature branch checked out." >&2
     echo "    If this repo needs a specific GitHub account, check gh / GH_PROFILE." >&2
