@@ -47,7 +47,8 @@ number (`jr view 63504`) is resolved against `JIRA_PROJECT_PREFIXES`.
 | `approve [--force] [--no-sql] [--no-jenkins] [TICKET]` | Finish review, then fill the Code Review Checklist (see below). |
 | `merge [--force] [TICKET]` | Merge the approved PR, move Merge → Test in Main, then fill the Merge Results template. |
 | `transitions <TICKET>` | List available transitions. |
-| `assign <TICKET> [NAME]` | Assign to a user (fuzzy name/email match); NAME omitted = assign to yourself. |
+| `assign [TICKET] [NAME]` | Assign to a user (fuzzy name/email match); NAME omitted = assign to yourself; TICKET omitted = current branch. |
+| `assign -u\|--unassign [TICKET]` | Clear the assignee. |
 | `users <TICKET> [query]` | List assignable users. |
 
 ## Review workflow

@@ -1435,9 +1435,26 @@ else:
 }
 
 cmd_assign() {
-  [[ $# -lt 1 ]] && { echo "Usage: jr assign <TICKET> [NAME]   (NAME omitted = assign to yourself)" >&2; return 1; }
+  local unassign=0 rest=()
+  for a in "$@"; do
+    case "$a" in
+      --unassign|-u) unassign=1 ;;
+      *)             rest+=("$a") ;;
+    esac
+  done
+  set -- "${rest[@]}"
+
   local ticket
-  ticket=$(_jr_resolve_ticket "$1") || return 1
+  ticket=$(_jr_resolve_ticket "${1:-.}") || return 1
+
+  # Unassign: clear the assignee. Mutually exclusive with a NAME argument.
+  if [[ $unassign -eq 1 ]]; then
+    [[ -n "${2:-}" ]] && { echo "jr: -u/--unassign cannot be combined with a NAME argument" >&2; return 1; }
+    _jr_api PUT "/issue/$ticket/assignee" '{"accountId":null}' > /dev/null \
+      || { echo "jr: failed to unassign $ticket" >&2; return 1; }
+    echo "$ticket → unassigned"
+    return 0
+  fi
 
   # No name → assign to the current user.
   if [[ -z "${2:-}" ]]; then
@@ -2188,7 +2205,8 @@ Commands:
                                 that only appear on transition screens (e.g. CapEx) cannot be set
                                 this way — jr move handles those automatically via transition fields.
   transitions <TICKET>            List available transitions for a ticket
-  assign      <TICKET> [NAME]     Assign ticket to a user (fuzzy name/email match); NAME omitted = assign to yourself
+  assign      [TICKET] [NAME]     Assign ticket to a user (fuzzy name/email match); NAME omitted = assign to yourself; TICKET omitted = current branch
+              -u|--unassign        Clear the assignee (jr assign -u [TICKET])
   users       <TICKET> [query]    List assignable users for a ticket
   help                            Show this help
 
