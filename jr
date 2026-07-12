@@ -2162,8 +2162,10 @@ cmd_reply() {
   local to="" body_file="" rest=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --to)                 to=$2;        shift 2 ;;
-      --file|--body-file)   body_file=$2; shift 2 ;;
+      --to)                 [[ $# -ge 2 ]] || { echo "jr reply: --to requires a comment id" >&2; return 1; }
+                            to=$2;        shift 2 ;;
+      --file|--body-file)   [[ $# -ge 2 ]] || { echo "jr reply: $1 requires a file path" >&2; return 1; }
+                            body_file=$2; shift 2 ;;
       -*)
         echo "jr reply: unknown flag '$1'" >&2
         echo "Usage: jr reply [TICKET] <FILE.md> [--to <COMMENT_ID>]" >&2
@@ -2215,8 +2217,12 @@ cmd_reply() {
   parent=$(_jr_api GET "/issue/$ticket/comment/$pid") || {
     echo "jr reply: comment $pid not found on $ticket" >&2; return 1; }
 
+  # Label used when the parent comment has no extractable first line.
+  local ref_fallback="the resolved comment"
+  [[ -n "$to" ]] && ref_fallback="the target comment"
+
   local body
-  body=$(JR_TICKET="$ticket" JR_PID="$pid" JR_FILE="$body_file" PARENT_JSON="$parent" python3 <<'PYEOF'
+  body=$(JR_TICKET="$ticket" JR_PID="$pid" JR_FILE="$body_file" JR_REF_FALLBACK="$ref_fallback" PARENT_JSON="$parent" python3 <<'PYEOF'
 import json, os, sys
 
 ticket   = os.environ["JR_TICKET"]
@@ -2326,7 +2332,7 @@ def _first_line(doc):
     return ""
 
 parent = json.loads(os.environ.get("PARENT_JSON", "{}") or "{}")
-label = _first_line(parent.get("body", {})) or "the resolved comment"
+label = _first_line(parent.get("body", {})) or os.environ.get("JR_REF_FALLBACK", "the resolved comment")
 if len(label) > 60:
     label = label[:57].rstrip() + "…"
 href = "%s/browse/%s?focusedCommentId=%s" % (base_url, ticket, pid)
