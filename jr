@@ -2154,6 +2154,208 @@ print(f"{ticket} -> updated {' and '.join(updated)}")
 PYEOF
 }
 
+cmd_reply() {
+  # Post a comment rendered from a markdown file as a reply *under* an existing
+  # comment. Default parent is the ticket's Resolved comment (the one jr resolve
+  # fills in); --to <id> targets any comment instead.
+  #   jr reply [TICKET] <FILE.md> [--to <COMMENT_ID>]
+  local to="" body_file="" rest=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --to)                 [[ $# -ge 2 ]] || { echo "jr reply: --to requires a comment id" >&2; return 1; }
+                            to=$2;        shift 2 ;;
+      --file|--body-file)   [[ $# -ge 2 ]] || { echo "jr reply: $1 requires a file path" >&2; return 1; }
+                            body_file=$2; shift 2 ;;
+      -*)
+        echo "jr reply: unknown flag '$1'" >&2
+        echo "Usage: jr reply [TICKET] <FILE.md> [--to <COMMENT_ID>]" >&2
+        return 1 ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+
+  # Positional forms: "TICKET FILE", "FILE", or (with --file) just "TICKET".
+  local ticket_arg=""
+  if [[ -n "$body_file" ]]; then
+    ticket_arg=${rest[0]:-}
+  else
+    case ${#rest[@]} in
+      2) ticket_arg=${rest[0]}; body_file=${rest[1]} ;;
+      1) body_file=${rest[0]} ;;
+      0) echo "jr reply: a markdown FILE is required" >&2
+         echo "Usage: jr reply [TICKET] <FILE.md> [--to <COMMENT_ID>]" >&2
+         return 1 ;;
+      *) echo "jr reply: too many arguments" >&2
+         echo "Usage: jr reply [TICKET] <FILE.md> [--to <COMMENT_ID>]" >&2
+         return 1 ;;
+    esac
+  fi
+
+  local ticket
+  ticket=$(_jr_resolve_ticket "${ticket_arg:-.}") || return 1
+  [[ -f "$body_file" ]] || { echo "jr reply: file not found: $body_file" >&2; return 1; }
+
+  # Resolve the parent comment: an explicit --to wins; otherwise find the
+  # Resolved comment jr resolve produced (filled or still a template).
+  local pid="$to"
+  if [[ -z "$pid" ]]; then
+    local me state
+    me=$(_jr_api GET "/myself" | python3 -c "import json, sys; print(json.load(sys.stdin).get('accountId', ''))")
+    [[ -n "$me" ]] || { echo "jr reply: could not determine the current Jira user" >&2; return 1; }
+    state=$(_jr_api GET "/issue/$ticket/comment" | _jr_resolved_state "$me")
+    case "$state" in
+      FILLED:*|TEMPLATE:*|TEMPLATE_RETRY:*) pid=${state#*:} ;;
+      *)
+        echo "jr reply: no Resolved comment found on $ticket." >&2
+        echo "    Run 'jr resolve' first, or target a comment with --to <id>." >&2
+        return 1 ;;
+    esac
+  fi
+
+  # Fetch the parent (also validates the id — _jr_api uses -f, so 404 → non-zero).
+  local parent
+  parent=$(_jr_api GET "/issue/$ticket/comment/$pid") || {
+    echo "jr reply: comment $pid not found on $ticket" >&2; return 1; }
+
+  # Label used when the parent comment has no extractable first line.
+  local ref_fallback="the resolved comment"
+  [[ -n "$to" ]] && ref_fallback="the target comment"
+
+  local body
+  body=$(JR_TICKET="$ticket" JR_PID="$pid" JR_FILE="$body_file" JR_REF_FALLBACK="$ref_fallback" PARENT_JSON="$parent" python3 <<'PYEOF'
+import json, os, sys
+
+ticket   = os.environ["JR_TICKET"]
+pid      = os.environ["JR_PID"]
+base_url = os.environ["JIRA_BASE"].rstrip("/")
+try:
+    with open(os.environ["JR_FILE"], encoding="utf-8") as fh:
+        body_md = fh.read()
+except OSError as e:
+    sys.stderr.write("jr reply: cannot read file: %s\n" % e)
+    sys.exit(1)
+
+# ── Markdown → ADF (mirrors cmd_edit; see developer guide's converter table) ──
+def _inline(children):
+    out = []
+    for tok in children or []:
+        t = tok.get("type")
+        if t == "text":
+            if tok.get("raw"):
+                out.append({"type": "text", "text": tok["raw"]})
+        elif t == "codespan":
+            if tok.get("raw"):
+                out.append({"type": "text", "text": tok["raw"], "marks": [{"type": "code"}]})
+        elif t == "link":
+            href = (tok.get("attrs") or {}).get("url", "")
+            kids = _inline(tok.get("children", [])) or ([{"type": "text", "text": href}] if href else [])
+            for n in kids:
+                if n.get("type") == "text":
+                    n.setdefault("marks", []).append({"type": "link", "attrs": {"href": href}})
+            out.extend(kids)
+        elif t == "strong":
+            kids = _inline(tok.get("children", []))
+            for n in kids:
+                # ADF rejects code+strong on the same node; drop the outer mark.
+                if n.get("type") == "text" and not any(m.get("type") == "code" for m in n.get("marks", [])):
+                    n.setdefault("marks", []).append({"type": "strong"})
+            out.extend(kids)
+        elif t == "emphasis":
+            kids = _inline(tok.get("children", []))
+            for n in kids:
+                # ADF rejects code+em on the same node; drop the outer mark.
+                if n.get("type") == "text" and not any(m.get("type") == "code" for m in n.get("marks", [])):
+                    n.setdefault("marks", []).append({"type": "em"})
+            out.extend(kids)
+        elif t in ("linebreak", "softbreak"):
+            out.append({"type": "hardBreak"})
+        elif tok.get("raw"):
+            out.append({"type": "text", "text": tok["raw"]})
+    return out
+
+def _blocks(tokens):
+    out = []
+    for tok in tokens or []:
+        t = tok.get("type")
+        if t == "blank_line":
+            continue
+        elif t == "heading":
+            lvl = min(6, (tok.get("attrs") or {}).get("level", 1))
+            c_nodes = _inline(tok.get("children", []))
+            if c_nodes:
+                out.append({"type": "heading", "attrs": {"level": lvl}, "content": c_nodes})
+        elif t in ("paragraph", "block_text"):
+            c_nodes = _inline(tok.get("children", []))
+            if c_nodes:
+                out.append({"type": "paragraph", "content": c_nodes})
+        elif t == "block_quote":
+            inner = _blocks(tok.get("children", [])) or [{"type": "paragraph"}]
+            out.append({"type": "blockquote", "content": inner})
+        elif t == "list":
+            ordered = (tok.get("attrs") or {}).get("ordered", False)
+            items = []
+            for li in tok.get("children", []):
+                inner = _blocks(li.get("children", [])) or [{"type": "paragraph"}]
+                items.append({"type": "listItem", "content": inner})
+            if items:
+                out.append({"type": "orderedList" if ordered else "bulletList", "content": items})
+        elif t == "thematic_break":
+            out.append({"type": "rule"})
+        elif t == "block_code":
+            code = tok.get("raw", "")
+            out.append({"type": "codeBlock", "content": [{"type": "text", "text": code}]})
+        elif tok.get("raw"):
+            out.append({"type": "paragraph", "content": [{"type": "text", "text": tok["raw"]}]})
+    return out
+
+def md_to_blocks(text):
+    if not text.strip():
+        return []
+    try:
+        import mistune
+        md = mistune.create_markdown(renderer=None)
+        return _blocks(md(text))
+    except ImportError:
+        sys.stderr.write("jr reply: mistune not installed — body sent as plain text. Install with: pip install mistune\n")
+        return [{"type": "paragraph", "content": [{"type": "text", "text": p.strip()}]}
+                for p in text.split("\n\n") if p.strip()]
+
+# ── Reply reference: a blockquote linking back to the parent comment ──────────
+def _first_line(doc):
+    if not isinstance(doc, dict):
+        return ""
+    for node in doc.get("content", []):
+        if node.get("type") in ("paragraph", "heading"):
+            txt = "".join(n.get("text", "") for n in node.get("content", []) if n.get("type") == "text").strip()
+            if txt:
+                return txt
+    return ""
+
+parent = json.loads(os.environ.get("PARENT_JSON", "{}") or "{}")
+label = _first_line(parent.get("body", {})) or os.environ.get("JR_REF_FALLBACK", "the resolved comment")
+if len(label) > 60:
+    label = label[:57].rstrip() + "…"
+href = "%s/browse/%s?focusedCommentId=%s" % (base_url, ticket, pid)
+
+reference = {"type": "blockquote", "content": [{"type": "paragraph", "content": [
+    {"type": "text", "text": "↳ In reply to "},
+    {"type": "text", "text": label, "marks": [{"type": "link", "attrs": {"href": href}}]},
+]}]}
+
+blocks = md_to_blocks(body_md)
+if not blocks:
+    sys.stderr.write("jr reply: %s has no content to post\n" % os.environ["JR_FILE"])
+    sys.exit(1)
+
+print(json.dumps({"body": {"type": "doc", "version": 1, "content": [reference] + blocks}}))
+PYEOF
+) || return 1
+
+  _jr_comment_write POST "/issue/$ticket/comment" "$body" \
+    "failed to post reply to $ticket" || return 1
+  echo "$ticket → reply posted under comment $pid"
+}
+
 cmd_open() {
   local print_only=0
   local rest=()
@@ -2185,6 +2387,8 @@ Commands:
   move        <TICKET> <STATUS>   Transition a ticket to a new status (moving to In Progress claims it for you; errors if owned by someone else)
   comment     <TICKET> <TEXT>     Add a comment to a ticket
   comments    [TICKET] [-N]       Show latest N comments (default 3), rendered — e.g. -5 for last 5
+  reply       [TICKET] <FILE.md> [--to <COMMENT_ID>]
+                                  Post a markdown file as a reply under the ticket's Resolved comment (or --to a specific comment). Handy for local-testing evidence + ELK log links.
   resolve     [--force] [TICKET]  Move to review, then fill the review template comment from the current branch's PR (--force overwrites a filled one)
   approve     [--force] [--no-sql] [--no-jenkins] [TICKET]
                                   Finish review: move Review → Test in Branch, then fill the Code Review Checklist (tick Done, keep first 3 + last row, Action: Ready for test).
@@ -2234,6 +2438,7 @@ case "$cmd" in
   move|mv)        cmd_move        "$@" ;;
   comment)        cmd_comment     "$@" ;;
   comments)       cmd_comments    "$@" ;;
+  reply)          cmd_reply       "$@" ;;
   resolve)        cmd_resolve     "$@" ;;
   approve)        cmd_approve     "$@" ;;
   merge)          cmd_merge       "$@" ;;

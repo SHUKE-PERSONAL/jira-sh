@@ -42,6 +42,7 @@ number (`jr view 63504`) is resolved against `JIRA_PROJECT_PREFIXES`.
 | `start [TICKET]` | Start work: reach In Progress in one hop, or via Ready when Jira blocks the direct jump. Claims the ticket; handles the CapEx gate. |
 | `move <TICKET> <STATUS>` | Transition a ticket (moving to In Progress claims it for you; errors if owned by someone else). |
 | `comment <TICKET> <TEXT>` | Add a comment. |
+| `reply [TICKET] <FILE.md> [--to <COMMENT_ID>]` | Post a markdown file as a reply under the ticket's Resolved comment (or `--to` a specific comment). |
 | `view [TICKET]` | Show a ticket's fields and full rendered description. |
 | `resolve [--force] [TICKET]` | Move to review, then fill the review template comment from the current branch's PR. |
 | `approve [--force] [--no-sql] [--no-jenkins] [TICKET]` | Finish review, then fill the Code Review Checklist (see below). |
@@ -90,6 +91,25 @@ jr approve --no-jenkins # drop the Jenkins pipelines row
 jr approve -sj          # short forms bundle: -s (no-sql) -j (no-jenkins) -f (force)
 jr approve -sjf MT-63504 # skip both rows and overwrite a filled checklist
 ```
+
+### `jr reply`
+
+Attaches a comment rendered from a **markdown file** as a reply *under* an
+existing comment — by default the ticket's **Resolved** comment. Handy for
+posting local-testing evidence (a short write-up plus an ELK log link) right
+where the reviewer expects it, without hand-editing ADF:
+
+```bash
+jr reply MT-63504 evidence.md          # reply under the Resolved comment
+jr reply evidence.md                   # ticket derived from the current branch
+jr reply evidence.md --to 10456        # reply to a specific comment id
+```
+
+Jira issue comments are flat — there is no native comment threading in the REST
+API — so the "reply" is a new comment that opens with a blockquote linking back
+to the parent comment's permalink. Requires `mistune` for markdown rendering
+(the same dependency `jr resolve` uses); without it the body posts as plain
+text.
 
 ## Transition validators
 
