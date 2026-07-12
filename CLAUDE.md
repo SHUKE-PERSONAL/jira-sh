@@ -71,14 +71,13 @@ in the error body, prompt or resolve from config, retry the transition POST.
 
 ## Markdown → ADF converters
 
-There are **four separate copies** of the Markdown→ADF inline converter:
+There are **three separate copies** of the Markdown→ADF inline converter:
 
 | Location | Used by | Special behaviour |
 |----------|---------|-------------------|
 | `_jr_resolve_adf` PYEOF (~lines 380–510) | `cmd_resolve` | Runs mistune; demotes heading levels +2; strips Claude Code footer; wraps in full "Resolved" template with checklist |
 | `cmd_create` PYEOF (~lines 1504–1778) | `jr create` | Degrades to plain-text on missing mistune; no demoting |
 | `cmd_edit` PYEOF (~lines 1817–1982) | `jr edit` | Near-identical to `cmd_create` version |
-| `cmd_reply` PYEOF | `jr reply` | Copy of `cmd_edit`'s converter; prepends a blockquote "↳ In reply to <link>" reference to the parent comment, then posts the rendered body as a new comment |
 
 **ADF constraint you must not break:** a text node cannot carry both `code` and
 `strong`/`em` marks. Jira returns 400. The pattern in `_jr_resolve_adf` is an
@@ -165,10 +164,10 @@ bash variables set inside the heredoc.
   (edit endpoint), which rejects transition-screen fields with 400. `jr move`
   injects them via the transition `fields` body instead.
 
-- **Four ADF converters, not one.** They diverged intentionally (different
+- **Three ADF converters, not one.** They diverged intentionally (different
   template shapes), but the `code`+`strong`/`em` guard must be kept in sync
-  across all four. Commit `bb0c23c` fixed it in `cmd_create`; `cccf7c7` fixed
-  it in `_jr_resolve_adf`. `cmd_reply`'s converter is a copy of `cmd_edit`'s.
+  across all three. Commit `bb0c23c` fixed it in `cmd_create`; `cccf7c7` fixed
+  it in `_jr_resolve_adf`.
 
 - **`_jr_api_status` body/code split is newline-sensitive.** The separator is a
   literal `$'\n'` (ANSI-C quoting). The curl `-w '\n%{http_code}'` appends a
