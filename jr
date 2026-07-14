@@ -5,7 +5,10 @@
 # `read`/`$()` keep the trailing \r — silently poisoning every value we capture
 # (breaks string compares, embeds \r in JSON, garbles output via carriage
 # returns). Strip it at the single source so callers never see it.
-python3() { command python3 "$@" | tr -d '\r'; }
+# Pipe through tr to strip the \r, but propagate python's real exit code (not
+# tr's, which is always 0) so callers can branch on sys.exit(...) — e.g. a clean
+# non-zero when an API body comes back empty on 4xx.
+python3() { command python3 "$@" | tr -d '\r'; return "${PIPESTATUS[0]}"; }
 
 _jr_check_env() {
   local missing=()
@@ -1357,7 +1360,17 @@ else:
     _jr_api GET "/issue/$ticket/editmeta" | python3 -c "
 import json, sys
 fid = sys.argv[1]
-f = json.load(sys.stdin).get('fields', {}).get(fid, {})
+tk  = sys.argv[2]
+raw = sys.stdin.read()
+if not raw.strip():
+    print(f'jr: could not read {tk} — not found or no access', file=sys.stderr)
+    sys.exit(1)
+try:
+    meta = json.loads(raw)
+except json.JSONDecodeError:
+    print(f'jr: could not read {tk} — not found or no access', file=sys.stderr)
+    sys.exit(1)
+f = meta.get('fields', {}).get(fid, {})
 name = f.get('name', fid)
 allowed = f.get('allowedValues', [])
 if not allowed:
@@ -1367,7 +1380,7 @@ print(f'Options for {name} ({fid}):')
 for opt in allowed:
     val = opt.get('value') or opt.get('name', '')
     print('  id=%-8s  %s' % (opt.get('id',''), val))
-" "$field_id"
+" "$field_id" "$ticket"
     return $?
   fi
 
@@ -1635,7 +1648,9 @@ PYEOF
 
 cmd_create() {
   local title="" body="" body_file="" priority="" points="" epic="" issue_type=""
-  local no_sprint=0 dry_run=0
+  local no_sprint=0 dry_run=0 team="" sprint=""
+  local -a fields=() components=()
+  local usage="Usage: jr create --title \"...\" [--body \"...\"|--body-file path] [--priority P] [--points N] [--type T] [--epic KEY] [--team NAME|ID] [--component NAME|ID]... [--sprint ID|active|none] [--no-sprint] [-F customfield_X=VALUE]... [--dry-run]"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1646,17 +1661,21 @@ cmd_create() {
       --points)     points=$2;     shift 2 ;;
       --epic)       epic=$2;       shift 2 ;;
       --type)       issue_type=$2; shift 2 ;;
+      --team)       team=$2;       shift 2 ;;
+      --sprint)     sprint=$2;     shift 2 ;;
+      --component)  components+=("$2"); shift 2 ;;
+      -F|--field)   fields+=("$2");     shift 2 ;;
       --no-sprint)  no_sprint=1;   shift ;;
       --dry-run)    dry_run=1;     shift ;;
       *) echo "jr create: unknown flag '$1'" >&2
-         echo "Usage: jr create --title \"...\" [--body \"...\"|--body-file path] [--priority P] [--points N] [--type T] [--epic KEY] [--no-sprint] [--dry-run]" >&2
+         echo "$usage" >&2
          return 1 ;;
     esac
   done
 
   [[ -z "$title" ]] && {
     echo "jr create: --title is required" >&2
-    echo "Usage: jr create --title \"...\" [--body \"...\"|--body-file path] [--priority P] [--points N] [--type T] [--epic KEY] [--no-sprint] [--dry-run]" >&2
+    echo "$usage" >&2
     return 1
   }
 
@@ -1665,12 +1684,22 @@ cmd_create() {
     body=$(cat "$body_file")
   fi
 
+  # Repeatable flags reach the PYEOF as newline-joined env vars (empty when
+  # unused so Python sees no phantom entry). Field values never contain newlines.
+  local fields_joined="" components_joined=""
+  [[ ${#fields[@]}     -gt 0 ]] && fields_joined=$(printf '%s\n' "${fields[@]}")
+  [[ ${#components[@]} -gt 0 ]] && components_joined=$(printf '%s\n' "${components[@]}")
+
   JR_TITLE="$title" \
   JR_BODY="$body" \
   JR_PRIORITY="$priority" \
   JR_POINTS="$points" \
   JR_EPIC="$epic" \
   JR_TYPE="$issue_type" \
+  JR_TEAM="$team" \
+  JR_SPRINT="$sprint" \
+  JR_COMPONENTS="$components_joined" \
+  JR_FIELDS="$fields_joined" \
   JR_NO_SPRINT="$no_sprint" \
   JR_DRY_RUN="$dry_run" \
   python3 <<'PYEOF'
@@ -1720,6 +1749,13 @@ Output a ready-to-save ~/.jr.toml in this format:
     # Example: pre-set CapEx so the Ready transition never blocks for this field:
     # [create.extra_fields]
     # customfield_11902 = {value = "No"}   # CapEx — set to "Yes" if this is CapEx work
+
+    # Per-issue-type profiles override [create] when --type matches. Use them to
+    # declare fields a type requires (e.g. Bug Severity) without polluting the
+    # global defaults. Precedence: CLI flag > [create.type.<Type>] > [create].
+    # [create.type.Bug]
+    # priority     = "High"
+    # extra_fields = { customfield_12533 = {id = "16499"} }   # Bug Severity QA
 ---
 
 Once saved, re-run your `jr create` command.
@@ -1742,17 +1778,39 @@ with open(config_path, "rb") as fh:
 
 c = cfg.get("create", {})
 
-# ── Merge CLI overrides over config defaults ───────────────────────────────────
+# ── Resolve the effective issue type, then its per-type profile ────────────────
+# Precedence for every field: CLI flag > [create.type.<Type>] > [create] / global.
+issuetype = os.environ.get("JR_TYPE") or c.get("issuetype", "Story")
+tp        = (c.get("type", {}) or {}).get(issuetype, {}) or {}
+
+def _scalar(cli_env, key, default=None):
+    """CLI env override, then type profile, then [create] default."""
+    v = os.environ.get(cli_env)
+    if v:
+        return v
+    if tp.get(key) not in (None, ""):
+        return tp[key]
+    if c.get(key) not in (None, ""):
+        return c[key]
+    return default
+
+# ── Merge CLI overrides over profile over config defaults ──────────────────────
 project    = c.get("project", "MT")
-issuetype  = os.environ.get("JR_TYPE")     or c.get("issuetype",   "Story")
-priority   = os.environ.get("JR_PRIORITY") or c.get("priority",    "Medium")
-points_raw = os.environ.get("JR_POINTS")   or str(c.get("story_points", ""))
+priority   = _scalar("JR_PRIORITY", "priority", "Medium")
+points_raw = os.environ.get("JR_POINTS")
+if not points_raw:
+    if tp.get("story_points") not in (None, ""):
+        points_raw = str(tp["story_points"])
+    elif c.get("story_points") not in (None, ""):
+        points_raw = str(c["story_points"])
+    else:
+        points_raw = ""
 points     = float(points_raw) if points_raw else None
 assignee   = c.get("assignee", "self")
-labels     = c.get("labels", [])
+labels     = tp.get("labels", c.get("labels", []))
 title      = os.environ.get("JR_TITLE", "")
 body_md    = os.environ.get("JR_BODY", "")
-epic       = os.environ.get("JR_EPIC") or (c.get("epic") or {}).get("key", "")
+epic       = os.environ.get("JR_EPIC") or tp.get("epic") or (c.get("epic") or {}).get("key", "")
 no_sprint  = os.environ.get("JR_NO_SPRINT") == "1"
 dry_run    = os.environ.get("JR_DRY_RUN")  == "1"
 
@@ -1783,19 +1841,52 @@ if assignee == "self":
 else:
     assignee_id = assignee
 
-# ── Active sprint ─────────────────────────────────────────────────────────────
-sprint_id = None
+# ── Sprint ────────────────────────────────────────────────────────────────────
+# --sprint <id|active|none> overrides the [create.sprint] auto behaviour; a name
+# resolves against the configured board's active+future sprints.
+sprint_id  = None
 sprint_cfg = c.get("sprint", {})
-if sprint_cfg.get("auto") and not no_sprint:
-    board_id = sprint_cfg.get("board")
-    if board_id:
-        try:
-            data = api_get(f"/board/{board_id}/sprint?state=active", agile=True)
-            sprints = data.get("values", [])
-            if sprints:
-                sprint_id = sprints[0]["id"]
-        except Exception as e:
-            sys.stderr.write(f"jr: warning — could not fetch active sprint: {e}\n")
+board_id   = sprint_cfg.get("board")
+sprint_arg = os.environ.get("JR_SPRINT", "").strip()
+
+def _fetch_active_sprint():
+    if not board_id:
+        return None
+    try:
+        data = api_get(f"/board/{board_id}/sprint?state=active", agile=True)
+        sprints = data.get("values", [])
+        return sprints[0]["id"] if sprints else None
+    except Exception as e:
+        sys.stderr.write(f"jr: warning — could not fetch active sprint: {e}\n")
+        return None
+
+def _resolve_sprint_by_name(name):
+    if not board_id:
+        sys.stderr.write("jr: --sprint <name> needs [create.sprint].board in ~/.jr.toml\n")
+        sys.exit(1)
+    try:
+        data = api_get(f"/board/{board_id}/sprint?state=active,future", agile=True)
+        for s in data.get("values", []):
+            if s.get("name", "").lower() == name.lower():
+                return s["id"]
+    except Exception as e:
+        sys.stderr.write(f"jr: could not fetch sprints for board {board_id}: {e}\n")
+        sys.exit(1)
+    sys.stderr.write(f"jr: no active/future sprint named '{name}' on board {board_id}\n")
+    sys.exit(1)
+
+if sprint_arg:
+    low = sprint_arg.lower()
+    if low == "none":
+        sprint_id = None
+    elif low == "active":
+        sprint_id = _fetch_active_sprint()
+    elif sprint_arg.isdigit():
+        sprint_id = int(sprint_arg)
+    else:
+        sprint_id = _resolve_sprint_by_name(sprint_arg)
+elif sprint_cfg.get("auto") and not no_sprint:
+    sprint_id = _fetch_active_sprint()
 
 # ── Markdown → ADF ────────────────────────────────────────────────────────────
 def _inline(children):
@@ -1902,11 +1993,14 @@ desc = md_to_adf_doc(body_md)
 if desc:
     fields["description"] = desc
 
+# ── Team default from config (may be overridden by --team below) ───────────────
 team_cfg = c.get("team", {})
 if team_cfg.get("field") and team_cfg.get("id"):
     fields[team_cfg["field"]] = {"id": team_cfg["id"]}
 
-for k, v in (c.get("extra_fields") or {}).items():
+# ── extra_fields: [create.type.<Type>] merges over global [create.extra_fields] ─
+merged_extra = {**(c.get("extra_fields") or {}), **(tp.get("extra_fields") or {})}
+for k, v in merged_extra.items():
     fields[k] = v
 
 if sprint_id is not None:
@@ -1914,6 +2008,53 @@ if sprint_id is not None:
 
 if epic:
     fields["customfield_10016"] = epic
+
+# ── CLI named-flag overrides (win over config + profile) ───────────────────────
+def _opt_value(raw):
+    """Select-option value: numeric → {"id": n}, else {"value": name}."""
+    return {"id": raw} if raw.isdigit() else {"value": raw}
+
+team_override = os.environ.get("JR_TEAM", "").strip()
+if team_override:
+    tf = team_cfg.get("field")
+    if not tf:
+        sys.stderr.write("jr: --team needs [create.team].field in ~/.jr.toml\n")
+        sys.exit(1)
+    fields[tf] = _opt_value(team_override)
+
+comps = [x for x in os.environ.get("JR_COMPONENTS", "").split("\n") if x]
+if comps:
+    fields["components"] = [
+        ({"id": x} if x.isdigit() else {"name": x}) for x in comps
+    ]
+
+# ── Generic -F/--field overrides (highest precedence; applied last) ────────────
+def _field_value(raw):
+    """set-field value semantics: {…}/[…] → raw JSON, bare number → number,
+    else → {"value": raw}."""
+    s = raw.strip()
+    if s[:1] in ("{", "["):
+        return json.loads(s)
+    if s.isdigit():
+        return int(s)
+    try:
+        return float(s) if s.replace(".", "", 1).isdigit() else {"value": raw}
+    except ValueError:
+        return {"value": raw}
+
+for entry in os.environ.get("JR_FIELDS", "").split("\n"):
+    if not entry.strip():
+        continue
+    if "=" not in entry:
+        sys.stderr.write(f"jr: -F expects customfield_XXXXX=VALUE, got '{entry}'\n")
+        sys.exit(1)
+    k, v = entry.split("=", 1)
+    k = k.strip()
+    try:
+        fields[k] = _field_value(v)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"jr: -F {k}: invalid JSON value: {e}\n")
+        sys.exit(1)
 
 payload = {"fields": fields}
 
@@ -2191,8 +2332,11 @@ Commands:
                                   --no-sql / --no-jenkins drop the SQL / Jenkins rows for tickets with no SQL changes or projects with no Jenkins pipeline.
                                   Short forms bundle: -s (no-sql), -j (no-jenkins), -f (force) — e.g. -sj skips both, -sjf also overwrites.
   merge       [--force] [TICKET]  Merge the approved PR (squash if yours, merge otherwise), move Merge → Test in Main, then fill the Merge Results template
-  create      --title "..." [--body "..." | --body-file path] [--priority P] [--points N] [--type T] [--epic KEY] [--no-sprint] [--dry-run]
-                                  Create a new ticket (defaults from ~/.jr.toml; --dry-run prints the JSON payload without creating)
+  create      --title "..." [--body "..." | --body-file path] [--priority P] [--points N] [--type T] [--epic KEY]
+              [--team NAME|ID] [--component NAME|ID]... [--sprint ID|active|none] [--no-sprint] [-F customfield_X=VALUE]... [--dry-run]
+                                  Create a new ticket (defaults from ~/.jr.toml; --dry-run prints the JSON payload without creating).
+                                  Overrides win over config: CLI flag > [create.type.<Type>] profile > [create]/[create.extra_fields].
+                                  -F/--field takes customfield_XXXXX=<value|json> (repeatable): {…}/[…] raw JSON, bare number, else {"value":…}.
   edit        [TICKET] [--title "..."] [--body "..." | --body-file path] [--force] [--dry-run]
                                   Update the title and/or body of a ticket you reported; --force/-f edits any ticket
   open        [-p] [TICKET]       Open ticket in the browser (-p / --print to only echo the URL)
@@ -2223,6 +2367,13 @@ Optional ~/.jr.toml sections:
                         Ready transition. Set field to the Jira custom field ID
                         (e.g. customfield_12345). yes_value/no_value default to
                         "Yes"/"No" if omitted.
+  [create.type.<Type>]  Per-issue-type profile for jr create, e.g. [create.type.Bug].
+                        Keys: priority, story_points, epic, labels, and an
+                        extra_fields table merged over the global
+                        [create.extra_fields]. Lets a type declare its own
+                        required fields (e.g. Bug Severity) without touching the
+                        global profile. The <Type> must match the issue-type name.
+                        Precedence: CLI flag > [create.type.<Type>] > [create].
 EOF
 }
 
