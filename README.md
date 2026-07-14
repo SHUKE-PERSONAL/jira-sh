@@ -46,6 +46,9 @@ number (`jr view 63504`) is resolved against `JIRA_PROJECT_PREFIXES`.
 | `resolve [--force] [TICKET]` | Move to review, then fill the review template comment from the current branch's PR. |
 | `approve [--force] [--no-sql] [--no-jenkins] [TICKET]` | Finish review, then fill the Code Review Checklist (see below). |
 | `merge [--force] [TICKET]` | Merge the approved PR, move Merge → Test in Main, then fill the Merge Results template. |
+| `create --title "..." [...]` | Create a ticket from `~/.jr.toml` defaults, with per-invocation overrides (see [Creating tickets](#creating-tickets)). |
+| `edit [TICKET] [--title ...] [--body ...]` | Update the title and/or body of a ticket you reported (`--force` edits any ticket). |
+| `set-field <TICKET> <FIELD> <VALUE\|--list-options>` | Set a custom field via the Edit screen; `--list-options` lists a select field's allowed values. |
 | `transitions <TICKET>` | List available transitions. |
 | `assign [TICKET] [NAME]` | Assign to a user (fuzzy name/email match); NAME omitted = assign to yourself; TICKET omitted = current branch. |
 | `assign -u\|--unassign [TICKET]` | Clear the assignee. |
@@ -89,6 +92,48 @@ jr approve --no-sql     # drop the SQL Standards row
 jr approve --no-jenkins # drop the Jenkins pipelines row
 jr approve -sj          # short forms bundle: -s (no-sql) -j (no-jenkins) -f (force)
 jr approve -sjf MT-63504 # skip both rows and overwrite a filled checklist
+```
+
+## Creating tickets
+
+`jr create` builds the payload from `~/.jr.toml` (`[create]`, `[create.team]`,
+`[create.sprint]`, `[create.extra_fields]`) and lets any invocation override
+those defaults:
+
+```bash
+jr create --title "Fix widget" --type Bug \
+  -F customfield_12533='{"id":"16498"}' \   # Bug Severity QA (raw JSON)
+  --component DFX --sprint active
+jr create --title "..." --dry-run           # print the JSON payload, create nothing
+```
+
+Override flags (all optional; defaults come from config):
+
+| Flag | Effect |
+| --- | --- |
+| `-F, --field customfield_X=<value\|json>` | Set any field (repeatable). `{…}`/`[…]` → raw JSON, a bare number → number, anything else → `{"value": …}`. Same value semantics as `set-field`. |
+| `--component <name\|id>` | Add a component (repeatable); numeric → `{"id":…}`, else `{"name":…}`. |
+| `--team <name\|id>` | Override the `[create.team]` default; numeric → `{"id":…}`, else `{"value":…}`. |
+| `--sprint <id\|active\|none>` | Target a specific sprint id, force the board's active sprint, or attach none. (`--no-sprint` is the same as `none`.) |
+| `--priority`, `--points`, `--type`, `--epic` | Override the matching `[create]` default. |
+
+**Per-issue-type profiles** let a type declare its own defaults and required
+fields so `--type Bug` picks the right values without any flags:
+
+```toml
+[create.type.Bug]
+priority     = "High"
+extra_fields = { customfield_12533 = { id = "16499" } }  # Bug Severity QA default
+```
+
+The `[create.type.<Type>]` key must match the issue-type name. Its `extra_fields`
+merge over the global `[create.extra_fields]`; its scalar keys (`priority`,
+`story_points`, `epic`, `labels`) override the corresponding `[create]` value.
+
+**Precedence** (highest wins):
+
+```
+CLI flag  >  [create.type.<Type>]  >  [create.extra_fields] / [create]
 ```
 
 ## Transition validators
