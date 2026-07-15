@@ -1968,9 +1968,9 @@ PYEOF
 
 cmd_create() {
   local title="" body="" body_file="" priority="" points="" epic="" issue_type=""
-  local no_sprint=0 dry_run=0 team="" sprint="" project=""
+  local no_sprint=0 dry_run=0 team="" sprint="" project="" assignee="" refine=0
   local -a fields=() components=()
-  local usage="Usage: jr create --title \"...\" [--body \"...\"|--body-file path] [--project KEY] [--priority P] [--points N] [--type T] [--epic KEY] [--team NAME|ID] [--component NAME|ID]... [--sprint ID|active|none] [--no-sprint] [-F customfield_X=VALUE]... [--dry-run]"
+  local usage="Usage: jr create --title \"...\" [--body \"...\"|--body-file path] [--project KEY] [--priority P] [--points N] [--type T] [--epic KEY] [--team NAME|ID] [--component NAME|ID]... [--assignee self|none|NAME] [--sprint ID|active|none] [--no-sprint] [--refine] [-F customfield_X=VALUE]... [--dry-run]"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1983,16 +1983,25 @@ cmd_create() {
       --epic)       epic=$2;       shift 2 ;;
       --type)       issue_type=$2; shift 2 ;;
       --team)       team=$2;       shift 2 ;;
+      --assignee)   assignee=$2;   shift 2 ;;
       --sprint)     sprint=$2;     shift 2 ;;
       --component)  components+=("$2"); shift 2 ;;
       -F|--field)   fields+=("$2");     shift 2 ;;
       --no-sprint)  no_sprint=1;   shift ;;
+      --refine)     refine=1;      shift ;;
       --dry-run)    dry_run=1;     shift ;;
       *) echo "jr create: unknown flag '$1'" >&2
          echo "$usage" >&2
          return 1 ;;
     esac
   done
+
+  # --refine raises a backlog-first ticket: no sprint, and unassigned unless an
+  # explicit --assignee was given. The sprint+self default is unchanged otherwise.
+  if [[ $refine -eq 1 ]]; then
+    no_sprint=1
+    [[ -z "$assignee" ]] && assignee="none"
+  fi
 
   # Branch-derived project prefix — fallback when neither --project nor config
   # supplies a project (so a config-less create can still target the right key).
@@ -2026,6 +2035,7 @@ cmd_create() {
   JR_EPIC="$epic" \
   JR_TYPE="$issue_type" \
   JR_TEAM="$team" \
+  JR_ASSIGNEE="$assignee" \
   JR_SPRINT="$sprint" \
   JR_COMPONENTS="$components_joined" \
   JR_FIELDS="$fields_joined" \
@@ -2082,11 +2092,15 @@ Output a ready-to-save ~/.jr.toml in this format:
     # customfield_11902 = {value = "No"}   # CapEx — set to "Yes" if this is CapEx work
 
     # Per-issue-type profiles override [create] when --type matches. Use them to
-    # declare fields a type requires (e.g. Bug Severity) without polluting the
-    # global defaults. Precedence: CLI flag > [create.type.<Type>] > [create].
+    # declare fields a type requires (e.g. Bug Severity) or a type-specific select
+    # (e.g. Task Category) without polluting the global defaults, so --type picks
+    # the right value with no -F. Precedence: CLI flag > [create.type.<Type>] > [create].
     # [create.type.Bug]
     # priority     = "High"
     # extra_fields = { customfield_12533 = {id = "16499"} }   # Bug Severity QA
+    #
+    # [create.type."Tech Debt"]                               # quote names with spaces
+    # extra_fields = { customfield_13009 = {id = "15985"} }   # Task Category = Tech 4 Tech
 ---
 
 Once saved, re-run your `jr create` command.
@@ -2156,9 +2170,9 @@ if not points_raw:
     else:
         points_raw = ""
 points     = float(points_raw) if points_raw else None
-# Assignee: config default is "self"; with no config, default to unset so a
-# config-less create doesn't silently self-assign. (--assignee is #24.)
-assignee   = c.get("assignee") or ("self" if config_present else "")
+# Assignee: --assignee (self|none|NAME) wins; else config default "self"; with no
+# config, default to unset so a config-less create doesn't silently self-assign.
+assignee   = os.environ.get("JR_ASSIGNEE") or c.get("assignee") or ("self" if config_present else "")
 labels     = tp.get("labels", c.get("labels", []))
 title      = os.environ.get("JR_TITLE", "")
 body_md    = os.environ.get("JR_BODY", "")
@@ -2187,14 +2201,31 @@ def api_get(path, agile=False):
     return _curl_get(f"{base_url}{root}{path}")
 
 # ── Assignee ──────────────────────────────────────────────────────────────────
-# Empty ⇒ leave unset (Jira applies the project default / unassigned).
-if not assignee:
+# self → me; none/empty → unset (Jira applies the project default / unassigned);
+# an accountId (24-hex-ish) → used as-is; anything else → resolve by name/email.
+if not assignee or assignee.lower() == "none":
     assignee_id = None
-elif assignee == "self":
+elif assignee.lower() == "self":
     me = api_get("/myself")
     assignee_id = me["accountId"]
-else:
+elif len(assignee) >= 20 and all(ch in "0123456789abcdef:-" for ch in assignee.lower()):
     assignee_id = assignee
+else:
+    from urllib.parse import quote
+    users = api_get(f"/user/search?query={quote(assignee)}")
+    matches = [u for u in users
+               if assignee.lower() in (u.get("displayName", "").lower()
+                                        + " " + u.get("emailAddress", "").lower())]
+    if len(matches) == 1:
+        assignee_id = matches[0]["accountId"]
+    elif not matches:
+        sys.stderr.write(f"jr create: no user matching --assignee '{assignee}'\n")
+        sys.exit(1)
+    else:
+        sys.stderr.write(f"jr create: --assignee '{assignee}' matches multiple users:\n")
+        for u in matches[:10]:
+            sys.stderr.write(f"    {u.get('displayName','?')} <{u.get('emailAddress','')}>\n")
+        sys.exit(1)
 
 # ── Sprint ────────────────────────────────────────────────────────────────────
 # --sprint <id|active|none> overrides the [create.sprint] auto behaviour; a name
@@ -2385,18 +2416,66 @@ if comps:
     ]
 
 # ── Generic -F/--field overrides (highest precedence; applied last) ────────────
-def _field_value(raw):
-    """set-field value semantics: {…}/[…] → raw JSON, bare number → number,
-    else → {"value": raw}."""
+# For a select field, a bare-string -F value can be given as the option *label*;
+# we resolve it to {"id": …} against the field's createmeta allowedValues. The
+# createmeta is fetched lazily (only when a bare-string -F exists) and cached.
+_cm_cache = {}
+def _createmeta_options():
+    if "opts" in _cm_cache:
+        return _cm_cache["opts"]
+    opts = {}
+    try:
+        type_id, start = None, 0
+        while True:  # hop 1: issue-type name → id (startAt/total paging)
+            d = api_get(f"/issue/createmeta/{project}/issuetypes?startAt={start}&maxResults=50")
+            batch = d.get("issueTypes", []) or []
+            for it in batch:
+                if (it.get("name") or "").lower() == issuetype.lower():
+                    type_id = it.get("id"); break
+            total = d.get("total")
+            if type_id or not batch or (total is not None and start + len(batch) >= total):
+                break
+            start += len(batch)
+        if type_id:
+            start = 0
+            while True:  # hop 2: field allowedValues
+                d = api_get(f"/issue/createmeta/{project}/issuetypes/{type_id}?startAt={start}&maxResults=50")
+                batch = d.get("fields", []) or []
+                for fld in batch:
+                    m = {}
+                    for o in fld.get("allowedValues") or []:
+                        label = o.get("value") or o.get("name") or o.get("displayName")
+                        if label and o.get("id"):
+                            m[str(label).lower()] = o["id"]
+                    if m:
+                        opts[fld.get("fieldId")] = m
+                total = d.get("total")
+                if not batch or (total is not None and start + len(batch) >= total):
+                    break
+                start += len(batch)
+    except Exception as e:
+        sys.stderr.write(f"jr: warning — could not resolve -F labels via createmeta: {e}\n")
+    _cm_cache["opts"] = opts
+    return opts
+
+def _field_value(raw, field_id):
+    """set-field value semantics: {…}/[…] → raw JSON, bare number → number; a
+    bare string resolves against the field's option labels (→ {"id": …}) when a
+    match exists, else {"value": raw}."""
     s = raw.strip()
     if s[:1] in ("{", "["):
         return json.loads(s)
     if s.isdigit():
         return int(s)
-    try:
-        return float(s) if s.replace(".", "", 1).isdigit() else {"value": raw}
-    except ValueError:
-        return {"value": raw}
+    if s.replace(".", "", 1).isdigit():
+        try:
+            return float(s)
+        except ValueError:
+            pass
+    m = _createmeta_options().get(field_id)
+    if m and s.lower() in m:
+        return {"id": m[s.lower()]}
+    return {"value": raw}
 
 for entry in os.environ.get("JR_FIELDS", "").split("\n"):
     if not entry.strip():
@@ -2407,7 +2486,7 @@ for entry in os.environ.get("JR_FIELDS", "").split("\n"):
     k, v = entry.split("=", 1)
     k = k.strip()
     try:
-        fields[k] = _field_value(v)
+        fields[k] = _field_value(v, k)
     except json.JSONDecodeError as e:
         sys.stderr.write(f"jr: -F {k}: invalid JSON value: {e}\n")
         sys.exit(1)
@@ -2700,11 +2779,14 @@ Commands:
                                   Short forms bundle: -s (no-sql), -j (no-jenkins), -f (force) — e.g. -sj skips both, -sjf also overwrites.
   merge       [--force] [TICKET]  Merge the approved PR (squash if yours, merge otherwise), move Merge → Test in Main, then fill the Merge Results template
   create      --title "..." [--body "..." | --body-file path] [--project KEY] [--priority P] [--points N] [--type T] [--epic KEY]
-              [--team NAME|ID] [--component NAME|ID]... [--sprint ID|active|none] [--no-sprint] [-F customfield_X=VALUE]... [--dry-run]
+              [--team NAME|ID] [--component NAME|ID]... [--assignee self|none|NAME] [--sprint ID|active|none] [--no-sprint] [--refine]
+              [-F customfield_X=VALUE]... [--dry-run]
                                   Create a new ticket (defaults from ~/.jr.toml; --dry-run prints the JSON payload without creating).
                                   Works without ~/.jr.toml: pass --project (or rely on the branch prefix) and --type; -F for required fields.
                                   Overrides win over config: CLI flag > [create.type.<Type>] profile > [create]/[create.extra_fields].
-                                  -F/--field takes customfield_XXXXX=<value|json> (repeatable): {…}/[…] raw JSON, bare number, else {"value":…}.
+                                  -F/--field takes customfield_XXXXX=<value|json> (repeatable): {…}/[…] raw JSON, bare number, a select
+                                  option *label* (resolved to its id via createmeta — see jr fields), else {"value":…}.
+                                  --assignee self|none|NAME sets/omits the assignee. --refine raises a backlog item (no sprint + unassigned).
   edit        [TICKET] [--title "..."] [--body "..." | --body-file path] [--force] [--dry-run]
                                   Update the title and/or body of a ticket you reported; --force/-f edits any ticket
   open        [-p] [TICKET]       Open ticket in the browser (-p / --print to only echo the URL)

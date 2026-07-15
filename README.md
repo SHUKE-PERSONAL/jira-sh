@@ -123,7 +123,8 @@ custom fields from `-F` (use [`jr fields`](#commands) to discover their ids).
 Without a config file the ticket is left unassigned unless you set an assignee.
 
 ```bash
-jr create --project MT --type "Tech Debt" --title "..." -F customfield_13009='{"id":"15985"}'
+# option labels resolve to their ids via createmeta — no need to look up 15985
+jr create --project MT --type "Tech Debt" --title "..." -F customfield_13009="Tech 4 Tech"
 ```
 
 Override flags (all optional; defaults come from config):
@@ -131,24 +132,32 @@ Override flags (all optional; defaults come from config):
 | Flag | Effect |
 | --- | --- |
 | `--project <key>` | Target project key. Falls back to `[create].project`, then the branch prefix, then the first `JIRA_PROJECT_PREFIXES` entry. |
-| `-F, --field customfield_X=<value\|json>` | Set any field (repeatable). `{…}`/`[…]` → raw JSON, a bare number → number, anything else → `{"value": …}`. Same value semantics as `set-field`. |
+| `-F, --field customfield_X=<value\|json\|label>` | Set any field (repeatable). `{…}`/`[…]` → raw JSON, a bare number → number, a **select option label** → resolved to `{"id": …}` via createmeta (see [`jr fields`](#commands)), anything else → `{"value": …}`. |
 | `--component <name\|id>` | Add a component (repeatable); numeric → `{"id":…}`, else `{"name":…}`. |
 | `--team <name\|id>` | Override the `[create.team]` default; numeric → `{"id":…}`, else `{"value":…}`. |
+| `--assignee self\|none\|<name>` | `self` → you, `none` → unassigned, a name/email → fuzzy-resolved. Overrides `[create].assignee`. |
 | `--sprint <id\|active\|none>` | Target a specific sprint id, force the board's active sprint, or attach none. (`--no-sprint` is the same as `none`.) |
+| `--refine` | Raise a backlog item: implies `--no-sprint` and (unless `--assignee` is given) `--assignee none`. |
 | `--priority`, `--points`, `--type`, `--epic` | Override the matching `[create]` default. |
 
 **Per-issue-type profiles** let a type declare its own defaults and required
-fields so `--type Bug` picks the right values without any flags:
+fields so `--type Bug` picks the right values without any flags. This is also
+how you bind a type-specific select (e.g. Task Category) to the type, so a Tech
+Debt ticket doesn't inherit the wrong global category:
 
 ```toml
 [create.type.Bug]
 priority     = "High"
 extra_fields = { customfield_12533 = { id = "16499" } }  # Bug Severity QA default
+
+[create.type."Tech Debt"]                                # quote names with spaces
+extra_fields = { customfield_13009 = { id = "15985" } }  # Task Category = Tech 4 Tech
 ```
 
-The `[create.type.<Type>]` key must match the issue-type name. Its `extra_fields`
-merge over the global `[create.extra_fields]`; its scalar keys (`priority`,
-`story_points`, `epic`, `labels`) override the corresponding `[create]` value.
+The `[create.type.<Type>]` key must match the issue-type name (quote it if it
+contains spaces). Its `extra_fields` merge over the global `[create.extra_fields]`;
+its scalar keys (`priority`, `story_points`, `epic`, `labels`) override the
+corresponding `[create]` value.
 
 **Precedence** (highest wins):
 
