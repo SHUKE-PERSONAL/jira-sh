@@ -1968,15 +1968,16 @@ PYEOF
 
 cmd_create() {
   local title="" body="" body_file="" priority="" points="" epic="" issue_type=""
-  local no_sprint=0 dry_run=0 team="" sprint=""
+  local no_sprint=0 dry_run=0 team="" sprint="" project=""
   local -a fields=() components=()
-  local usage="Usage: jr create --title \"...\" [--body \"...\"|--body-file path] [--priority P] [--points N] [--type T] [--epic KEY] [--team NAME|ID] [--component NAME|ID]... [--sprint ID|active|none] [--no-sprint] [-F customfield_X=VALUE]... [--dry-run]"
+  local usage="Usage: jr create --title \"...\" [--body \"...\"|--body-file path] [--project KEY] [--priority P] [--points N] [--type T] [--epic KEY] [--team NAME|ID] [--component NAME|ID]... [--sprint ID|active|none] [--no-sprint] [-F customfield_X=VALUE]... [--dry-run]"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --title)      title=$2;      shift 2 ;;
       --body)       body=$2;       shift 2 ;;
       --body-file)  body_file=$2;  shift 2 ;;
+      --project)    project=$2;    shift 2 ;;
       --priority)   priority=$2;   shift 2 ;;
       --points)     points=$2;     shift 2 ;;
       --epic)       epic=$2;       shift 2 ;;
@@ -1992,6 +1993,12 @@ cmd_create() {
          return 1 ;;
     esac
   done
+
+  # Branch-derived project prefix — fallback when neither --project nor config
+  # supplies a project (so a config-less create can still target the right key).
+  local branch_prefix="" branch_key
+  branch_key=$(git rev-parse --abbrev-ref HEAD 2>/dev/null | grep -oiE "(${JIRA_PROJECT_PREFIXES})-[0-9]+" | head -1)
+  [[ -n "$branch_key" ]] && branch_prefix=$(echo "${branch_key%%-*}" | tr '[:lower:]' '[:upper:]')
 
   [[ -z "$title" ]] && {
     echo "jr create: --title is required" >&2
@@ -2012,6 +2019,8 @@ cmd_create() {
 
   JR_TITLE="$title" \
   JR_BODY="$body" \
+  JR_PROJECT="$project" \
+  JR_BRANCH_PREFIX="$branch_prefix" \
   JR_PRIORITY="$priority" \
   JR_POINTS="$points" \
   JR_EPIC="$epic" \
@@ -2026,13 +2035,14 @@ cmd_create() {
   python3 <<'PYEOF'
 import json, os, subprocess, sys
 
-# ── Config ────────────────────────────────────────────────────────────────────
-config_path = os.path.expanduser("~/.jr.toml")
-if not os.path.exists(config_path):
-    sys.stderr.write("""\
-jr: ~/.jr.toml not found.
+# ── Config (optional) ─────────────────────────────────────────────────────────
+# A missing ~/.jr.toml is not fatal: create degrades to a flag/env-driven path.
+# The setup prompt below is emitted only when an *essential* (project or type)
+# is also unresolved from flags/env.
+SETUP_PROMPT = """\
 
-To get set up, paste the following into a chat with an AI agent:
+No ~/.jr.toml found. `jr create` still works from flags (--project/--type/-F),
+but for reusable defaults paste the following into a chat with an AI agent:
 
 ---
 I use `jr`, a Jira CLI tool. I need you to generate a ~/.jr.toml config file for me.
@@ -2080,28 +2090,41 @@ Output a ready-to-save ~/.jr.toml in this format:
 ---
 
 Once saved, re-run your `jr create` command.
-""")
-    sys.exit(1)
+"""
 
-try:
-    import tomllib
-except ImportError:
+config_path = os.path.expanduser("~/.jr.toml")
+config_present = os.path.exists(config_path)
+cfg = {}
+if config_present:
     try:
-        import tomli as tomllib
+        import tomllib
     except ImportError:
-        sys.stderr.write(
-            "jr: Python 3.11+ required for TOML support, or install tomli: pip install tomli\n"
-        )
-        sys.exit(1)
+        try:
+            import tomli as tomllib
+        except ImportError:
+            sys.stderr.write(
+                "jr: Python 3.11+ required for TOML support, or install tomli: pip install tomli\n"
+            )
+            sys.exit(1)
+    with open(config_path, "rb") as fh:
+        cfg = tomllib.load(fh)
 
-with open(config_path, "rb") as fh:
-    cfg = tomllib.load(fh)
+c = cfg.get("create", {}) or {}
 
-c = cfg.get("create", {})
+def _need(msg):
+    """Fail naming the unmet essential; append the setup prompt when config-less."""
+    sys.stderr.write(msg + "\n")
+    if not config_present:
+        sys.stderr.write(SETUP_PROMPT)
+    sys.exit(1)
 
 # ── Resolve the effective issue type, then its per-type profile ────────────────
 # Precedence for every field: CLI flag > [create.type.<Type>] > [create] / global.
-issuetype = os.environ.get("JR_TYPE") or c.get("issuetype", "Story")
+# With a config present, [create].issuetype (or "Story") is the fallback; with no
+# config, --type is required so a config-less create never guesses the type.
+issuetype = os.environ.get("JR_TYPE") or c.get("issuetype") or ("Story" if config_present else "")
+if not issuetype:
+    _need("jr create: no issue type — pass --type (e.g. --type Story)")
 tp        = (c.get("type", {}) or {}).get(issuetype, {}) or {}
 
 def _scalar(cli_env, key, default=None):
@@ -2116,7 +2139,13 @@ def _scalar(cli_env, key, default=None):
     return default
 
 # ── Merge CLI overrides over profile over config defaults ──────────────────────
-project    = c.get("project", "MT")
+# Project: --project > [create].project > branch prefix > first JIRA_PROJECT_PREFIXES.
+project    = (os.environ.get("JR_PROJECT") or c.get("project")
+              or os.environ.get("JR_BRANCH_PREFIX")
+              or (os.environ.get("JIRA_PROJECT_PREFIXES", "").split("|") or [""])[0])
+if not project:
+    _need("jr create: no project — pass --project, set [create].project, "
+          "or work on a branch with a ticket key")
 priority   = _scalar("JR_PRIORITY", "priority", "Medium")
 points_raw = os.environ.get("JR_POINTS")
 if not points_raw:
@@ -2127,7 +2156,9 @@ if not points_raw:
     else:
         points_raw = ""
 points     = float(points_raw) if points_raw else None
-assignee   = c.get("assignee", "self")
+# Assignee: config default is "self"; with no config, default to unset so a
+# config-less create doesn't silently self-assign. (--assignee is #24.)
+assignee   = c.get("assignee") or ("self" if config_present else "")
 labels     = tp.get("labels", c.get("labels", []))
 title      = os.environ.get("JR_TITLE", "")
 body_md    = os.environ.get("JR_BODY", "")
@@ -2156,7 +2187,10 @@ def api_get(path, agile=False):
     return _curl_get(f"{base_url}{root}{path}")
 
 # ── Assignee ──────────────────────────────────────────────────────────────────
-if assignee == "self":
+# Empty ⇒ leave unset (Jira applies the project default / unassigned).
+if not assignee:
+    assignee_id = None
+elif assignee == "self":
     me = api_get("/myself")
     assignee_id = me["accountId"]
 else:
@@ -2303,8 +2337,9 @@ fields = {
     "summary":   title,
     "issuetype": {"name": issuetype},
     "priority":  {"name": priority},
-    "assignee":  {"accountId": assignee_id},
 }
+if assignee_id is not None:
+    fields["assignee"] = {"accountId": assignee_id}
 if labels:
     fields["labels"] = labels
 if points is not None:
@@ -2664,9 +2699,10 @@ Commands:
                                   --no-sql / --no-jenkins drop the SQL / Jenkins rows for tickets with no SQL changes or projects with no Jenkins pipeline.
                                   Short forms bundle: -s (no-sql), -j (no-jenkins), -f (force) — e.g. -sj skips both, -sjf also overwrites.
   merge       [--force] [TICKET]  Merge the approved PR (squash if yours, merge otherwise), move Merge → Test in Main, then fill the Merge Results template
-  create      --title "..." [--body "..." | --body-file path] [--priority P] [--points N] [--type T] [--epic KEY]
+  create      --title "..." [--body "..." | --body-file path] [--project KEY] [--priority P] [--points N] [--type T] [--epic KEY]
               [--team NAME|ID] [--component NAME|ID]... [--sprint ID|active|none] [--no-sprint] [-F customfield_X=VALUE]... [--dry-run]
                                   Create a new ticket (defaults from ~/.jr.toml; --dry-run prints the JSON payload without creating).
+                                  Works without ~/.jr.toml: pass --project (or rely on the branch prefix) and --type; -F for required fields.
                                   Overrides win over config: CLI flag > [create.type.<Type>] profile > [create]/[create.extra_fields].
                                   -F/--field takes customfield_XXXXX=<value|json> (repeatable): {…}/[…] raw JSON, bare number, else {"value":…}.
   edit        [TICKET] [--title "..."] [--body "..." | --body-file path] [--force] [--dry-run]

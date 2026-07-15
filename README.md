@@ -116,10 +116,21 @@ jr create --title "Fix widget" --type Bug \
 jr create --title "..." --dry-run           # print the JSON payload, create nothing
 ```
 
+**No config file?** `jr create` also runs without `~/.jr.toml` — supply the
+essentials by flag. Project comes from `--project`, else the branch prefix, else
+the first `JIRA_PROJECT_PREFIXES` entry; issue type from `--type`; required
+custom fields from `-F` (use [`jr fields`](#commands) to discover their ids).
+Without a config file the ticket is left unassigned unless you set an assignee.
+
+```bash
+jr create --project MT --type "Tech Debt" --title "..." -F customfield_13009='{"id":"15985"}'
+```
+
 Override flags (all optional; defaults come from config):
 
 | Flag | Effect |
 | --- | --- |
+| `--project <key>` | Target project key. Falls back to `[create].project`, then the branch prefix, then the first `JIRA_PROJECT_PREFIXES` entry. |
 | `-F, --field customfield_X=<value\|json>` | Set any field (repeatable). `{…}`/`[…]` → raw JSON, a bare number → number, anything else → `{"value": …}`. Same value semantics as `set-field`. |
 | `--component <name\|id>` | Add a component (repeatable); numeric → `{"id":…}`, else `{"name":…}`. |
 | `--team <name\|id>` | Override the `[create.team]` default; numeric → `{"id":…}`, else `{"value":…}`. |
