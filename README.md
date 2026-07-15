@@ -25,6 +25,8 @@ source ~/.bashrc
 ## Usage
 
 ```bash
+jr ls                                  # your open tickets
+jr search "project = MT AND sprint in openSprints()"
 jr move PROJ-123 "In Review"
 jr comment PROJ-123 "Deployed to staging"
 jr view PROJ-123
@@ -35,10 +37,16 @@ A bare `.`, `@`, or an omitted `TICKET` derives the ticket from the current
 branch name (e.g. on `feature/mt-63504` you can just run `jr view`). A bare
 number (`jr view 63504`) is resolved against `JIRA_PROJECT_PREFIXES`.
 
+`--json` is a global flag: on `search`/`ls` it emits a JSON array, on `view` a
+single object, on `create` the `{key,url}` of the new ticket — pipe it to `jq`
+(`jr ls --json | jq -r '.[].key'`). Human-rendered output is the default.
+
 ## Commands
 
 | Command | What it does |
 | --- | --- |
+| `search "<JQL>" [--limit N]` | Run a JQL query; lists key/status/summary per hit. `--json` for a parseable array. |
+| `ls [filters] [--limit N]` | List tickets. No args = your open tickets. Filters: `--status`, `--project`, `--epic`, `--assignee NAME\|me\|none`, `--team` (needs `[create.team].field`). `--json` supported. |
 | `start [TICKET]` | Start work: reach In Progress in one hop, or via Ready when Jira blocks the direct jump. Claims the ticket; handles the CapEx gate. |
 | `move <TICKET> <STATUS>` | Transition a ticket (moving to In Progress claims it for you; errors if owned by someone else). |
 | `comment <TICKET> <TEXT>` | Add a comment. |

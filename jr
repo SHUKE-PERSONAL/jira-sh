@@ -1519,6 +1519,166 @@ else:
   esac
 }
 
+# Run a JQL query via the enhanced-search endpoint and render the hits, honoring
+# JR_OUTPUT_JSON (a JSON array) vs human lines. Caps at $2 results (default 50)
+# and notes on stderr when more were available. Token-paginated: the classic
+# GET /search is deprecated on Jira Cloud, so this uses POST /search/jql.
+_jr_search_run() {
+  local jql=$1 limit=${2:-50}
+  JR_JQL="$jql" JR_LIMIT="$limit" \
+  JIRA_BASE="$JIRA_BASE" JIRA_EMAIL="$JIRA_EMAIL" JIRA_TOKEN="$JIRA_TOKEN" \
+  JR_OUTPUT_JSON="${JR_OUTPUT_JSON:-}" python3 <<'PYEOF'
+import json, os, subprocess, sys
+
+base  = os.environ["JIRA_BASE"].rstrip("/")
+email = os.environ["JIRA_EMAIL"]
+token = os.environ["JIRA_TOKEN"]
+jql   = os.environ["JR_JQL"]
+limit = int(os.environ.get("JR_LIMIT") or "50")
+as_json = os.environ.get("JR_OUTPUT_JSON") == "1"
+
+def post(path, payload):
+    r = subprocess.run(
+        ["curl", "-s", "-w", "\n%{http_code}", "-X", "POST",
+         "--user", f"{email}:{token}",
+         "-H", "Content-Type: application/json",
+         "-H", "Accept: application/json",
+         "-d", json.dumps(payload),
+         f"{base}/rest/api/3{path}"],
+        capture_output=True, text=True)
+    lines = r.stdout.rsplit("\n", 1)
+    return (lines[1] if len(lines) > 1 else "0"), lines[0]
+
+issues, page_token, truncated = [], None, False
+while True:
+    payload = {"jql": jql,
+               "maxResults": max(1, min(100, limit - len(issues))),
+               "fields": ["summary", "status", "issuetype", "assignee"]}
+    if page_token:
+        payload["nextPageToken"] = page_token
+    code, body = post("/search/jql", payload)
+    if not code.startswith("2"):
+        sys.stderr.write(f"jr: search failed (HTTP {code})\n")
+        try:
+            d = json.loads(body)
+            for m in d.get("errorMessages", []): sys.stderr.write(f"    {m}\n")
+            for k, v in d.get("errors", {}).items(): sys.stderr.write(f"    {k}: {v}\n")
+        except Exception:
+            sys.stderr.write(body + "\n")
+        sys.exit(1)
+    data = json.loads(body)
+    for it in data.get("issues", []):
+        issues.append(it)
+        if len(issues) >= limit:
+            break
+    more = bool(data.get("nextPageToken")) and not data.get("isLast", False)
+    if len(issues) >= limit:
+        truncated = more
+        break
+    if not more:
+        break
+    page_token = data["nextPageToken"]
+
+def fv(d, *path):
+    for p in path:
+        d = d.get(p) if isinstance(d, dict) else None
+    return d
+
+def row(it):
+    f = it.get("fields", {}) or {}
+    return {
+        "key":      it.get("key", ""),
+        "summary":  f.get("summary") or "",
+        "status":   fv(f, "status", "name") or "",
+        "type":     fv(f, "issuetype", "name") or "",
+        "assignee": fv(f, "assignee", "displayName") or "Unassigned",
+        "url":      f"{base}/browse/{it.get('key', '')}",
+    }
+
+rows = [row(it) for it in issues]
+if as_json:
+    print(json.dumps(rows, indent=2))
+else:
+    if not rows:
+        print("  (no matching tickets)")
+    else:
+        kw = max(len(r["key"]) for r in rows)
+        sw = max(len(r["status"]) for r in rows)
+        for r in rows:
+            print("  %-*s  %-*s  %s" % (kw, r["key"], sw, r["status"], r["summary"]))
+if truncated:
+    sys.stderr.write(f"jr: showing first {len(rows)} (more available - raise --limit)\n")
+PYEOF
+}
+
+cmd_search() {
+  local limit=50 jql=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --limit) limit=$2; shift 2 ;;
+      -*)  echo "jr search: unknown flag '$1'" >&2; return 1 ;;
+      *)   jql=$1; shift ;;
+    esac
+  done
+  [[ -z "$jql" ]] && { echo 'Usage: jr search "<JQL>" [--limit N] [--json]' >&2; return 1; }
+  _jr_search_run "$jql" "$limit"
+}
+
+cmd_ls() {
+  local limit=50 status="" project="" epic="" assignee="" team=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --limit)    limit=$2;    shift 2 ;;
+      --status)   status=$2;   shift 2 ;;
+      --project)  project=$2;  shift 2 ;;
+      --epic)     epic=$2;     shift 2 ;;
+      --assignee) assignee=$2; shift 2 ;;
+      --team)     team=$2;     shift 2 ;;
+      -*) echo "jr ls: unknown flag '$1'" >&2
+          echo 'Usage: jr ls [--status S] [--project K] [--epic KEY] [--assignee NAME|me|none] [--team T] [--limit N] [--json]' >&2
+          return 1 ;;
+      *)  echo "jr ls: unexpected argument '$1' (use jr search for raw JQL)" >&2; return 1 ;;
+    esac
+  done
+
+  local -a clauses=()
+  # Assignee: default and 'me'/'self' → currentUser(); 'none'/'unassigned' → EMPTY.
+  case "$(echo "${assignee:-me}" | tr '[:upper:]' '[:lower:]')" in
+    me|self)         clauses+=("assignee = currentUser()") ;;
+    none|unassigned) clauses+=("assignee is EMPTY") ;;
+    *)               clauses+=("assignee = \"$assignee\"") ;;
+  esac
+  # Status: an explicit status filter, else "not done".
+  if [[ -n "$status" ]]; then clauses+=("status = \"$status\""); else clauses+=("statusCategory != Done"); fi
+  [[ -n "$project" ]] && clauses+=("project = \"$project\"")
+  [[ -n "$epic" ]]    && clauses+=("parent = \"$epic\"")
+  if [[ -n "$team" ]]; then
+    local tf
+    tf=$(python3 -c "
+import os, sys
+try:
+    import tomllib
+except ImportError:
+    try: import tomli as tomllib
+    except ImportError: sys.exit(0)
+p = os.path.expanduser('~/.jr.toml')
+if not os.path.exists(p): sys.exit(0)
+cfg = tomllib.load(open(p, 'rb'))
+print((cfg.get('create', {}).get('team', {}) or {}).get('field', ''))
+")
+    [[ -z "$tf" ]] && { echo "jr ls: --team needs [create.team].field in ~/.jr.toml" >&2; return 1; }
+    clauses+=("cf[${tf#customfield_}] = \"$team\"")
+  fi
+
+  local jql="" c
+  for c in "${clauses[@]}"; do
+    [[ -n "$jql" ]] && jql+=" AND "
+    jql+="$c"
+  done
+  jql+=" ORDER BY updated DESC"
+  _jr_search_run "$jql" "$limit"
+}
+
 cmd_view() {
   [[ $# -lt 1 && -z "${1:-}" ]] && set -- "."
   local ticket
@@ -1528,7 +1688,7 @@ cmd_view() {
   issue=$(_jr_api GET "/issue/$ticket?fields=summary,status,issuetype,priority,assignee,reporter,labels,description") || {
     echo "jr: ticket not found: $ticket" >&2; return 1; }
 
-  echo "$issue" | JIRA_BASE="$JIRA_BASE" KEY="$ticket" python3 -c "$(cat <<'PYEOF'
+  echo "$issue" | JIRA_BASE="$JIRA_BASE" KEY="$ticket" JR_OUTPUT_JSON="${JR_OUTPUT_JSON:-}" python3 -c "$(cat <<'PYEOF'
 import json, os, sys
 
 issue = json.load(sys.stdin)
@@ -1624,6 +1784,28 @@ def block(nodes, indent=0):
             lines += block(n['content'], indent)
     return lines
 
+desc = f.get('description')
+if isinstance(desc, dict) and desc.get('content'):
+    _t = '\n'.join(block(desc['content'])).strip('\n')
+    desc_text = _t if _t.strip() else ''
+else:
+    desc_text = ''
+
+if os.environ.get('JR_OUTPUT_JSON') == '1':
+    print(json.dumps({
+        'key':         key,
+        'summary':     summary,
+        'status':      status,
+        'type':        itype,
+        'priority':    prio,
+        'assignee':    assignee,
+        'reporter':    reporter,
+        'labels':      labels,
+        'url':         '%s/browse/%s' % (base, key),
+        'description': desc_text,
+    }, indent=2))
+    sys.exit(0)
+
 print('%s  %s' % (key, status))
 print('  Summary   %s' % summary)
 l = '  Type      %s' % itype
@@ -1636,12 +1818,7 @@ if labels:   print('  Labels    %s' % ', '.join(labels))
 print('  URL       %s/browse/%s' % (base, key))
 print()
 print('Description')
-desc = f.get('description')
-if isinstance(desc, dict) and desc.get('content'):
-    text = '\n'.join(block(desc['content'])).strip('\n')
-    print(text if text.strip() else '  (empty)')
-else:
-    print('  (no description)')
+print(desc_text if desc_text else ('  (empty)' if isinstance(desc, dict) else '  (no description)'))
 PYEOF
 )"
 }
@@ -1702,6 +1879,7 @@ cmd_create() {
   JR_FIELDS="$fields_joined" \
   JR_NO_SPRINT="$no_sprint" \
   JR_DRY_RUN="$dry_run" \
+  JR_OUTPUT_JSON="${JR_OUTPUT_JSON:-}" \
   python3 <<'PYEOF'
 import json, os, subprocess, sys
 
@@ -2087,7 +2265,10 @@ if not code.startswith("2"):
     sys.exit(1)
 result = json.loads(body)
 key = result["key"]
-print(f"{key}  {base_url}/browse/{key}")
+if os.environ.get("JR_OUTPUT_JSON") == "1":
+    print(json.dumps({"key": key, "url": f"{base_url}/browse/{key}"}, indent=2))
+else:
+    print(f"{key}  {base_url}/browse/{key}")
 PYEOF
 }
 
@@ -2322,6 +2503,10 @@ cmd_help() {
 Usage: jr <command> [args]
 
 Commands:
+  search      "<JQL>" [--limit N] Run a JQL query and list the matching tickets (key/status/summary); --json for a parseable array
+  ls          [filters] [--limit N]
+                                  List tickets. No args = your open tickets. Filters: --status S, --project K,
+                                  --epic KEY, --assignee NAME|me|none, --team T (needs [create.team].field). --json supported.
   start       [TICKET]            Start work: reach In Progress in one hop, or via Ready when Jira blocks the direct jump (claims the ticket; handles CapEx)
   move        <TICKET> <STATUS>   Transition a ticket to a new status (moving to In Progress claims it for you; errors if owned by someone else)
   comment     <TICKET> <TEXT>     Add a comment to a ticket
@@ -2356,6 +2541,9 @@ Commands:
 
 A bare ., @, or an omitted TICKET derives the ticket from the current branch name.
 
+--json is a global flag: on search/ls it emits a JSON array, on view a single object,
+on create the {key,url} of the new ticket. Human output is the default.
+
 Required env vars:
   JIRA_BASE             https://yourcompany.atlassian.net
   JIRA_EMAIL            your@email.com
@@ -2378,9 +2566,21 @@ EOF
 }
 
 _jr_check_env
+
+# Global --json: strip it from anywhere in the args and export a flag that the
+# supporting commands (search/ls/view/create) honor. No command takes --json as
+# a value, so removing it unconditionally is safe.
+_jr_args=()
+for _a in "$@"; do
+  if [[ "$_a" == "--json" ]]; then export JR_OUTPUT_JSON=1; else _jr_args+=("$_a"); fi
+done
+set -- "${_jr_args[@]}"
+
 cmd=${1:-help}
 shift 2>/dev/null || true
 case "$cmd" in
+  search)         cmd_search      "$@" ;;
+  ls|list)        cmd_ls          "$@" ;;
   start)          cmd_start       "$@" ;;
   move|mv)        cmd_move        "$@" ;;
   comment)        cmd_comment     "$@" ;;
