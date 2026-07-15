@@ -47,6 +47,7 @@ single object, on `create` the `{key,url}` of the new ticket — pipe it to `jq`
 | --- | --- |
 | `search "<JQL>" [--limit N]` | Run a JQL query; lists key/status/summary per hit. `--json` for a parseable array. |
 | `ls [filters] [--limit N]` | List tickets. No args = your open tickets. Filters: `--status`, `--project`, `--epic`, `--assignee NAME\|me\|none`, `--team` (needs `[create.team].field`). `--json` supported. |
+| `fields [--project K] [--type "T"]` | List createable fields for a project + issue type (required first) with field ids and, for selects, option id/label pairs. No existing ticket needed. `--json` supported. |
 | `start [TICKET]` | Start work: reach In Progress in one hop, or via Ready when Jira blocks the direct jump. Claims the ticket; handles the CapEx gate. |
 | `move <TICKET> <STATUS>` | Transition a ticket (moving to In Progress claims it for you; errors if owned by someone else). |
 | `comment <TICKET> <TEXT>` | Add a comment. |
