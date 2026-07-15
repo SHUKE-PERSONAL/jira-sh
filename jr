@@ -1679,6 +1679,149 @@ print((cfg.get('create', {}).get('team', {}) or {}).get('field', ''))
   _jr_search_run "$jql" "$limit"
 }
 
+cmd_fields() {
+  local project="" issue_type=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project) project=$2;    shift 2 ;;
+      --type)    issue_type=$2; shift 2 ;;
+      -*) echo "jr fields: unknown flag '$1'" >&2
+          echo 'Usage: jr fields [--project K] [--type "Issue Type"] [--json]' >&2
+          return 1 ;;
+      *)  echo "jr fields: unexpected argument '$1'" >&2; return 1 ;;
+    esac
+  done
+
+  # Branch-derived project prefix, used as a fallback when neither --project nor
+  # config supplies one.
+  local branch_prefix=""
+  local branch_key
+  branch_key=$(git rev-parse --abbrev-ref HEAD 2>/dev/null | grep -oiE "(${JIRA_PROJECT_PREFIXES})-[0-9]+" | head -1)
+  [[ -n "$branch_key" ]] && branch_prefix=$(echo "${branch_key%%-*}" | tr '[:lower:]' '[:upper:]')
+
+  JR_PROJECT="$project" JR_TYPE="$issue_type" JR_BRANCH_PREFIX="$branch_prefix" \
+  JIRA_BASE="$JIRA_BASE" JIRA_EMAIL="$JIRA_EMAIL" JIRA_TOKEN="$JIRA_TOKEN" \
+  JIRA_PROJECT_PREFIXES="$JIRA_PROJECT_PREFIXES" \
+  JR_OUTPUT_JSON="${JR_OUTPUT_JSON:-}" python3 <<'PYEOF'
+import json, os, subprocess, sys
+
+base  = os.environ["JIRA_BASE"].rstrip("/")
+email = os.environ["JIRA_EMAIL"]
+token = os.environ["JIRA_TOKEN"]
+as_json = os.environ.get("JR_OUTPUT_JSON") == "1"
+
+# ── Config defaults (optional; no ~/.jr.toml is fine) ──────────────────────────
+cfg = {}
+config_path = os.path.expanduser("~/.jr.toml")
+if os.path.exists(config_path):
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            import tomli as tomllib
+        except ImportError:
+            tomllib = None
+    if tomllib:
+        with open(config_path, "rb") as fh:
+            cfg = tomllib.load(fh)
+c = cfg.get("create", {}) or {}
+
+# ── Resolve project + issue type ───────────────────────────────────────────────
+project = (os.environ.get("JR_PROJECT") or c.get("project")
+           or os.environ.get("JR_BRANCH_PREFIX")
+           or (os.environ.get("JIRA_PROJECT_PREFIXES", "").split("|") or [""])[0])
+if not project:
+    sys.stderr.write("jr fields: no project — pass --project, set [create].project, "
+                     "or work on a branch with a ticket key\n")
+    sys.exit(1)
+
+type_name = os.environ.get("JR_TYPE") or c.get("issuetype")
+if not type_name:
+    sys.stderr.write("jr fields: no issue type — pass --type or set [create].issuetype\n")
+    sys.exit(1)
+
+def api_get(path):
+    r = subprocess.run(
+        ["curl", "-s", "-w", "\n%{http_code}",
+         "--user", f"{email}:{token}",
+         "-H", "Accept: application/json",
+         f"{base}/rest/api/3{path}"],
+        capture_output=True, text=True)
+    lines = r.stdout.rsplit("\n", 1)
+    code = lines[1] if len(lines) > 1 else "0"
+    if not code.startswith("2"):
+        sys.stderr.write(f"jr fields: request failed (HTTP {code}) on {path}\n")
+        try:
+            d = json.loads(lines[0])
+            for m in d.get("errorMessages", []): sys.stderr.write(f"    {m}\n")
+            for k, v in d.get("errors", {}).items(): sys.stderr.write(f"    {k}: {v}\n")
+        except Exception:
+            sys.stderr.write(lines[0] + "\n")
+        sys.exit(1)
+    return json.loads(lines[0])
+
+# These createmeta endpoints page with startAt/maxResults/total (no isLast), and
+# key the payload as "issueTypes" (hop 1) / "fields" (hop 2), not "values".
+def paged(path, key):
+    items, start = [], 0
+    while True:
+        data = api_get(f"{path}{'&' if '?' in path else '?'}startAt={start}&maxResults=50")
+        batch = data.get(key, []) or []
+        items.extend(batch)
+        total = data.get("total")
+        if not batch or (total is not None and start + len(batch) >= total):
+            break
+        start += len(batch)
+    return items
+
+# ── Hop 1: issue-type name → id ────────────────────────────────────────────────
+type_id = None
+for it in paged(f"/issue/createmeta/{project}/issuetypes", "issueTypes"):
+    if (it.get("name") or "").lower() == type_name.lower():
+        type_id = it.get("id")
+        break
+if not type_id:
+    sys.stderr.write(f"jr fields: no issue type '{type_name}' creatable in project {project}\n")
+    sys.exit(1)
+
+# ── Hop 2: createable fields for that type ─────────────────────────────────────
+values = paged(f"/issue/createmeta/{project}/issuetypes/{type_id}", "fields")
+
+def options(fld):
+    opts = []
+    for o in fld.get("allowedValues", []) or []:
+        label = o.get("value") or o.get("name") or o.get("displayName") or ""
+        oid = o.get("id", "")
+        if label or oid:
+            opts.append({"id": oid, "label": label})
+    return opts
+
+rows = []
+for fld in values:
+    rows.append({
+        "id":       fld.get("fieldId", ""),
+        "name":     fld.get("name", ""),
+        "required": bool(fld.get("required")),
+        "type":     ((fld.get("schema") or {}).get("type") or ""),
+        "options":  options(fld),
+    })
+# Required first, then optional; each group alphabetical by name.
+rows.sort(key=lambda r: (not r["required"], r["name"].lower()))
+
+if as_json:
+    print(json.dumps(rows, indent=2))
+    sys.exit(0)
+
+print(f"Createable fields - {project} / {type_name}  (required first)")
+for r in rows:
+    tag = "req" if r["required"] else "opt"
+    tp = f"  [{r['type']}]" if r["type"] else ""
+    print("  %-3s  %-22s  %s%s" % (tag, r["id"], r["name"], tp))
+    for o in r["options"]:
+        print("           id=%-10s %s" % (o["id"], o["label"]))
+PYEOF
+}
+
 cmd_view() {
   [[ $# -lt 1 && -z "${1:-}" ]] && set -- "."
   local ticket
@@ -2507,6 +2650,10 @@ Commands:
   ls          [filters] [--limit N]
                                   List tickets. No args = your open tickets. Filters: --status S, --project K,
                                   --epic KEY, --assignee NAME|me|none, --team T (needs [create.team].field). --json supported.
+  fields      [--project K] [--type "T"]
+                                  List createable fields for a project + issue type (required first) with field ids
+                                  and, for selects, option id/label pairs. Defaults to [create] project/type or the
+                                  branch prefix. No existing ticket needed (uses createmeta). --json supported.
   start       [TICKET]            Start work: reach In Progress in one hop, or via Ready when Jira blocks the direct jump (claims the ticket; handles CapEx)
   move        <TICKET> <STATUS>   Transition a ticket to a new status (moving to In Progress claims it for you; errors if owned by someone else)
   comment     <TICKET> <TEXT>     Add a comment to a ticket
@@ -2581,6 +2728,7 @@ shift 2>/dev/null || true
 case "$cmd" in
   search)         cmd_search      "$@" ;;
   ls|list)        cmd_ls          "$@" ;;
+  fields)         cmd_fields      "$@" ;;
   start)          cmd_start       "$@" ;;
   move|mv)        cmd_move        "$@" ;;
   comment)        cmd_comment     "$@" ;;
