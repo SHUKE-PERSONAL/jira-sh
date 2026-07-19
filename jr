@@ -1486,30 +1486,38 @@ cmd_assign() {
     echo "jr: failed to fetch users for $ticket" >&2; return 1
   }
   local match
+  # Emit status on line 1, and for a single match the accountId + displayName on
+  # lines 2-3. Newline separation (not a ':'-delimited string) is required because
+  # migrated accounts carry a realm-prefixed accountId like '557058:c461...' — the
+  # colon inside it collided with the field delimiter and truncated the id.
   match=$(echo "$result" | python3 -c "
 import json, sys
 users = json.loads(sys.stdin.read())
 q = sys.argv[1].lower()
 matches = [u for u in users if q in u.get('displayName','').lower() or q in u.get('emailAddress','').lower()]
 if len(matches) == 1:
-    print('OK:' + matches[0]['accountId'] + ':' + matches[0]['displayName'])
+    print('OK')
+    print(matches[0]['accountId'])
+    print(matches[0]['displayName'])
 elif len(matches) == 0:
-    print('NONE:')
+    print('NONE')
 else:
-    print('AMBIGUOUS:' + '\n'.join(f\"{u.get('displayName','?')} <{u.get('emailAddress','')}>\".strip() for u in matches))
+    print('AMBIGUOUS')
+    for u in matches:
+        print(f\"{u.get('displayName','?')} <{u.get('emailAddress','')}>\".strip())
 " "$query")
 
-  case "$match" in
-    OK:*)
-      local account_id display_name
-      account_id=${match#OK:}; account_id=${account_id%%:*}
-      display_name=${match#OK:*:}
-      _jr_api PUT "/issue/$ticket/assignee" "{\"accountId\":\"$account_id\"}" > /dev/null
+  local status account_id display_name
+  { read -r status; read -r account_id; read -r display_name; } <<< "$match"
+  case "$status" in
+    OK)
+      _jr_api PUT "/issue/$ticket/assignee" "{\"accountId\":\"$account_id\"}" > /dev/null \
+        || { echo "jr: failed to assign $ticket to ${display_name:-$query}" >&2; return 1; }
       echo "$ticket → assigned to $display_name"
       ;;
-    AMBIGUOUS:*)
+    AMBIGUOUS)
       echo "jr: '$query' matches multiple users:" >&2
-      echo "${match#AMBIGUOUS:}" | sed 's/^/  /' >&2
+      printf '%s\n' "$match" | tail -n +2 | sed 's/^/  /' >&2
       return 1
       ;;
     *)
