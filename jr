@@ -170,15 +170,106 @@ except Exception:
   fi
 }
 
-_jr_json_comment_body() {
-  python3 -c "
-import json, sys
-print(json.dumps({
-  'body': {
-    'type': 'doc', 'version': 1,
-    'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': sys.argv[1]}]}]
-  }
-}))" "$1"
+# Convert the markdown in $JR_MD into a Jira comment body: {"body": <adf doc>}
+# on stdout. Reuses the general converter shape embedded in cmd_create/cmd_edit
+# (paragraphs, headings, fenced/indented codeBlock, inline code, strong/em with
+# the mandatory code-mark guard, bullet/ordered lists, links, blockquote, rule,
+# hardBreak). Degrades to plain-text paragraphs when mistune is absent; exits 3
+# on an empty/whitespace-only body. The body is passed via the JR_MD env var
+# (not stdin): `python3 <<'PYEOF'` already consumes stdin for the script itself.
+_jr_md_to_adf_body() {
+  python3 <<'PYEOF'
+import json, os, sys
+
+def _inline(tokens):
+    out = []
+    for tok in tokens or []:
+        t = tok.get("type")
+        if t == "text":
+            if tok.get("raw"):
+                out.append({"type": "text", "text": tok["raw"]})
+        elif t == "codespan":
+            if tok.get("raw"):
+                out.append({"type": "text", "text": tok["raw"], "marks": [{"type": "code"}]})
+        elif t == "link":
+            href = (tok.get("attrs") or {}).get("url", "")
+            kids = _inline(tok.get("children", [])) or ([{"type": "text", "text": href}] if href else [])
+            for n in kids:
+                if n.get("type") == "text":
+                    n.setdefault("marks", []).append({"type": "link", "attrs": {"href": href}})
+            out.extend(kids)
+        elif t == "strong":
+            kids = _inline(tok.get("children", []))
+            for n in kids:
+                if n.get("type") == "text" and not any(m.get("type") == "code" for m in n.get("marks", [])):
+                    n.setdefault("marks", []).append({"type": "strong"})
+            out.extend(kids)
+        elif t == "emphasis":
+            kids = _inline(tok.get("children", []))
+            for n in kids:
+                if n.get("type") == "text" and not any(m.get("type") == "code" for m in n.get("marks", [])):
+                    n.setdefault("marks", []).append({"type": "em"})
+            out.extend(kids)
+        elif t in ("linebreak", "softbreak"):
+            out.append({"type": "hardBreak"})
+        elif tok.get("raw"):
+            out.append({"type": "text", "text": tok["raw"]})
+    return out
+
+def _blocks(tokens):
+    out = []
+    for tok in tokens or []:
+        t = tok.get("type")
+        if t == "blank_line":
+            continue
+        elif t == "heading":
+            lvl = min(6, (tok.get("attrs") or {}).get("level", 1))
+            c_nodes = _inline(tok.get("children", []))
+            if c_nodes:
+                out.append({"type": "heading", "attrs": {"level": lvl}, "content": c_nodes})
+        elif t in ("paragraph", "block_text"):
+            c_nodes = _inline(tok.get("children", []))
+            if c_nodes:
+                out.append({"type": "paragraph", "content": c_nodes})
+        elif t == "block_quote":
+            inner = _blocks(tok.get("children", [])) or [{"type": "paragraph"}]
+            out.append({"type": "blockquote", "content": inner})
+        elif t == "list":
+            ordered = (tok.get("attrs") or {}).get("ordered", False)
+            items = []
+            for li in tok.get("children", []):
+                inner = _blocks(li.get("children", [])) or [{"type": "paragraph"}]
+                items.append({"type": "listItem", "content": inner})
+            if items:
+                out.append({"type": "orderedList" if ordered else "bulletList", "content": items})
+        elif t == "thematic_break":
+            out.append({"type": "rule"})
+        elif t == "block_code":
+            code = tok.get("raw", "")
+            out.append({"type": "codeBlock", "content": [{"type": "text", "text": code}]})
+        elif tok.get("raw"):
+            out.append({"type": "paragraph", "content": [{"type": "text", "text": tok["raw"]}]})
+    return out
+
+text = os.environ.get("JR_MD", "")
+if not text.strip():
+    sys.stderr.write("jr: empty comment body\n")
+    sys.exit(3)
+try:
+    import mistune
+    md = mistune.create_markdown(renderer=None)
+    content = _blocks(md(text))
+except ImportError:
+    sys.stderr.write("jr: mistune not installed — comment sent as plain text. Install with: pip install mistune\n")
+    content = [
+        {"type": "paragraph", "content": [{"type": "text", "text": para.strip()}]}
+        for para in text.split("\n\n") if para.strip()
+    ]
+if not content:
+    sys.stderr.write("jr: empty comment body\n")
+    sys.exit(3)
+print(json.dumps({"body": {"type": "doc", "version": 1, "content": content}}))
+PYEOF
 }
 
 cmd_move() {
@@ -300,12 +391,37 @@ for t in json.loads(sys.stdin.read()).get('transitions', []):
 }
 
 cmd_comment() {
-  [[ $# -lt 2 ]] && { echo "Usage: jr comment <TICKET> <TEXT>" >&2; return 1; }
+  # Markdown body may come from --body-file <path>, stdin (bare `-`, or piped
+  # with no positional text), or the positional TEXT args (back-compat).
+  local ticket_arg="" body_file="" use_stdin="" positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --body-file) body_file=$2; shift 2 ;;
+      -)           use_stdin=1; shift ;;
+      *)           if [[ -z "$ticket_arg" ]]; then ticket_arg=$1; else positional+=("$1"); fi; shift ;;
+    esac
+  done
+  [[ -z "$ticket_arg" ]] && {
+    echo "Usage: jr comment <TICKET> [<TEXT> | --body-file <path> | -]" >&2; return 1; }
   local ticket
-  ticket=$(_jr_resolve_ticket "$1") || return 1; shift
+  ticket=$(_jr_resolve_ticket "$ticket_arg") || return 1
+
+  local md
+  if [[ -n "$body_file" ]]; then
+    [[ -r "$body_file" ]] || { echo "jr: cannot read --body-file: $body_file" >&2; return 1; }
+    md=$(cat -- "$body_file")
+  elif [[ -n "$use_stdin" || ( ${#positional[@]} -eq 0 && ! -t 0 ) ]]; then
+    md=$(cat)
+  elif [[ ${#positional[@]} -gt 0 ]]; then
+    md="${positional[*]}"
+  else
+    echo "Usage: jr comment <TICKET> [<TEXT> | --body-file <path> | -]" >&2; return 1
+  fi
+
   local body
-  body=$(_jr_json_comment_body "$*") || return 1
-  _jr_api POST "/issue/$ticket/comment" "$body" > /dev/null
+  body=$(JR_MD="$md" _jr_md_to_adf_body) || return 1
+  _jr_api POST "/issue/$ticket/comment" "$body" > /dev/null \
+    || { echo "jr: failed to add comment to $ticket" >&2; return 1; }
   echo "comment added to $ticket"
 }
 
@@ -2778,7 +2894,7 @@ Commands:
                                   branch prefix. No existing ticket needed (uses createmeta). --json supported.
   start       [TICKET]            Start work: reach In Progress in one hop, or via Ready when Jira blocks the direct jump (claims the ticket; handles CapEx)
   move        <TICKET> <STATUS>   Transition a ticket to a new status (moving to In Progress claims it for you; errors if owned by someone else)
-  comment     <TICKET> <TEXT>     Add a comment to a ticket
+  comment     <TICKET> [TEXT]     Add a comment (markdown → ADF); body via TEXT, --body-file <path>, or stdin
   comments    [TICKET] [-N]       Show latest N comments (default 3), rendered — e.g. -5 for last 5
   resolve     [--force] [TICKET]  Move to review, then fill the review template comment from the current branch's PR (--force overwrites a filled one)
   approve     [--force] [--no-sql] [--no-jenkins] [TICKET]
