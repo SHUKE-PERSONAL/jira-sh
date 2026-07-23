@@ -71,13 +71,14 @@ in the error body, prompt or resolve from config, retry the transition POST.
 
 ## Markdown → ADF converters
 
-There are **three separate copies** of the Markdown→ADF inline converter:
+There are **four separate copies** of the Markdown→ADF inline converter:
 
 | Location | Used by | Special behaviour |
 |----------|---------|-------------------|
-| `_jr_resolve_adf` PYEOF (~lines 380–510) | `cmd_resolve` | Runs mistune; demotes heading levels +2; strips Claude Code footer; wraps in full "Resolved" template with checklist |
-| `cmd_create` PYEOF (~lines 1504–1778) | `jr create` | Degrades to plain-text on missing mistune; no demoting |
-| `cmd_edit` PYEOF (~lines 1817–1982) | `jr edit` | Near-identical to `cmd_create` version |
+| `_jr_resolve_adf` PYEOF (~lines 538–734) | `cmd_resolve` | Runs mistune; demotes heading levels +2; strips Claude Code footer; wraps in full "Resolved" template with checklist |
+| `cmd_create` PYEOF (`_blocks`/`_inline`/`md_to_adf_doc`) | `jr create` | Degrades to plain-text on missing mistune; no demoting |
+| `cmd_edit` PYEOF (`_blocks`/`_inline`/`md_to_adf_doc`) | `jr edit` | Near-identical to `cmd_create` version |
+| `_jr_md_to_adf_body` PYEOF (~lines 180–273) | `jr comment` | Same converter as create/edit; reads markdown from `$JR_MD` (stdin is the heredoc script); emits `{"body": <doc>}`; exits 3 on empty body |
 
 **ADF constraint you must not break:** a text node cannot carry both `code` and
 `strong`/`em` marks. Jira returns 400. The pattern in `_jr_resolve_adf` is an
@@ -91,7 +92,7 @@ if mark.get("type") in ("strong", "em") and \
     continue
 ```
 
-If you change the Markdown→ADF logic, apply it to all three copies. They are
+If you change the Markdown→ADF logic, apply it to all four copies. They are
 not shared because each lives inside a different heredoc scope.
 
 ---
@@ -164,10 +165,17 @@ bash variables set inside the heredoc.
   (edit endpoint), which rejects transition-screen fields with 400. `jr move`
   injects them via the transition `fields` body instead.
 
-- **Three ADF converters, not one.** They diverged intentionally (different
+- **Four ADF converters, not one.** They diverged intentionally (different
   template shapes), but the `code`+`strong`/`em` guard must be kept in sync
-  across all three. Commit `bb0c23c` fixed it in `cmd_create`; `cccf7c7` fixed
-  it in `_jr_resolve_adf`.
+  across all four. Commit `bb0c23c` fixed it in `cmd_create`; `cccf7c7` fixed
+  it in `_jr_resolve_adf`. `_jr_md_to_adf_body` (`jr comment`) carries the same
+  guard.
+
+- **`jr comment` markdown body comes from `$JR_MD`, not stdin.** A
+  `python3 <<'PYEOF'` heredoc already consumes the process's stdin as the script
+  source, so `sys.stdin.read()` inside it returns empty. `_jr_md_to_adf_body`
+  reads the markdown from the `JR_MD` env var instead (`cmd_comment` sets it);
+  the create/edit converters use the same env-var pattern.
 
 - **`_jr_api_status` body/code split is newline-sensitive.** The separator is a
   literal `$'\n'` (ANSI-C quoting). The curl `-w '\n%{http_code}'` appends a

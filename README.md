@@ -29,6 +29,8 @@ jr ls                                  # your open tickets
 jr search "project = MT AND sprint in openSprints()"
 jr move PROJ-123 "In Review"
 jr comment PROJ-123 "Deployed to staging"
+jr comment PROJ-123 --body-file report.md      # markdown → native ADF
+cat report.md | jr comment PROJ-123            # ...or from stdin
 jr view PROJ-123
 jr help
 ```
@@ -50,7 +52,7 @@ single object, on `create` the `{key,url}` of the new ticket — pipe it to `jq`
 | `fields [--project K] [--type "T"]` | List createable fields for a project + issue type (required first) with field ids and, for selects, option id/label pairs. No existing ticket needed. `--json` supported. |
 | `start [TICKET]` | Start work: reach In Progress in one hop, or via Ready when Jira blocks the direct jump. Claims the ticket; handles the CapEx gate. |
 | `move <TICKET> <STATUS>` | Transition a ticket (moving to In Progress claims it for you; errors if owned by someone else). |
-| `comment <TICKET> <TEXT>` | Add a comment. |
+| `comment <TICKET> [TEXT]` | Add a comment. Markdown (headings, code, lists, bold, inline code) renders as native ADF. Body from `TEXT`, `--body-file <path>`, or stdin. |
 | `view [TICKET]` | Show a ticket's fields and full rendered description. |
 | `resolve [--force] [TICKET]` | Move to review, then fill the review template comment from the current branch's PR. |
 | `approve [--force] [--no-sql] [--no-jenkins] [TICKET]` | Finish review, then fill the Code Review Checklist (see below). |
