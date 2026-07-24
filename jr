@@ -1134,16 +1134,19 @@ import json, sys
 print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', ''))
 ")
   [[ -n "$status" ]] || { echo "jr: ticket not found: $ticket" >&2; return 1; }
+  local moved=0
   if [[ "${status,,}" == *"test in main"* ]]; then
     echo "$ticket already in '$status' — skipping move"
   else
     cmd_move "$ticket" "Test in Main" || return 1
+    moved=1
   fi
 
   # Moving to Test in Main triggers the workflow's "Merge Results" template,
-  # authored by us; poll for it and PUT-fill the table. If the only template
-  # present was authored by someone else, they already drove this transition —
-  # out of jr merge's scope; leave it untouched.
+  # authored by us; poll for it and PUT-fill the table. A prior round may leave
+  # someone else's Merge Results comment visible before ours lands, so a foreign
+  # comment is out of scope only when we did NOT just drive the transition —
+  # otherwise we keep waiting for our own template.
   local mbody
   mbody=$(_jr_merge_adf "$repo" "$head" "$base") || return 1
 
@@ -1169,8 +1172,14 @@ print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', '
         echo "    Re-run with --force to replace it." >&2
         return 1 ;;
       OTHER:*)
-        echo "jr: $ticket has a Merge Results comment authored by someone else — they already moved it on; out of scope, leaving it untouched."
-        return 0 ;;
+        if [[ $moved -eq 0 ]]; then
+          echo "jr: $ticket has a Merge Results comment authored by someone else — they already moved it on; out of scope, leaving it untouched."
+          return 0
+        fi
+        # We drove the transition, so our own template is still expected to
+        # appear; a prior round's comment just landed first. Fall through to the
+        # wait-then-post path instead of bailing out.
+        ;&
       *)
         if [[ $tries -gt 0 ]]; then
           [[ $tries -eq 10 ]] && echo "jr: waiting for the Merge Results template comment to appear…"
@@ -1367,8 +1376,10 @@ cmd_approve() {
   me=$(_jr_api GET "/myself" | python3 -c "import json, sys; print(json.load(sys.stdin).get('accountId', ''))")
   [[ -n "$me" ]] || { echo "jr: could not determine the current Jira user" >&2; return 1; }
 
-  # Move Review → Test in Branch first — unless it's already there.
-  local status
+  # Move Review → Test in Branch first — unless it's already there. Track whether
+  # we actually drove the transition: only then is a fresh template expected to
+  # appear under our account.
+  local status moved=0
   status=$(_jr_api GET "/issue/$ticket?fields=status" | python3 -c "
 import json, sys
 print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', ''))
@@ -1378,12 +1389,14 @@ print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', '
     echo "$ticket already in '$status' — skipping move"
   else
     cmd_move "$ticket" "Test in Branch" || return 1
+    moved=1
   fi
 
   # Moving to Test in Branch triggers the workflow's "Code Review Checklist"
-  # template, authored by us; poll for it and transform-fill it. If the only
-  # checklist present was authored by someone else, they already drove this
-  # transition — out of scope; leave it untouched.
+  # template, authored by us; poll for it and transform-fill it. A prior review
+  # round may leave someone else's checklist visible before ours lands, so a
+  # foreign checklist is out of scope only when we did NOT just drive the
+  # transition — otherwise we keep waiting for our own template.
   local tries=10 state cid tbody body
   while :; do
     state=$(_jr_api GET "/issue/$ticket/comment" | _jr_approve_state "$me")
@@ -1410,8 +1423,14 @@ print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', '
         echo "    Re-run with --force to replace it." >&2
         return 1 ;;
       OTHER:*)
-        echo "jr: $ticket has a Code Review Checklist authored by someone else — out of scope, leaving it untouched."
-        return 0 ;;
+        if [[ $moved -eq 0 ]]; then
+          echo "jr: $ticket has a Code Review Checklist authored by someone else — out of scope, leaving it untouched."
+          return 0
+        fi
+        # We drove the transition, so our own template is still expected to
+        # appear; a prior reviewer's checklist just landed first. Fall through to
+        # the wait-then-post path instead of bailing out.
+        ;&
       *)
         if [[ $tries -gt 0 ]]; then
           [[ $tries -eq 10 ]] && echo "jr: waiting for the Code Review Checklist template comment to appear…"
