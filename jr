@@ -247,6 +247,37 @@ def _blocks(tokens):
         elif t == "block_code":
             code = tok.get("raw", "")
             out.append({"type": "codeBlock", "content": [{"type": "text", "text": code}]})
+        elif t == "table":
+            rows = []
+            for section in tok.get("children", []):
+                st = section.get("type")
+                if st == "table_head":
+                    row_cells = []
+                    for cell in section.get("children", []):
+                        inner = _inline(cell.get("children", [])) or [{"type": "text", "text": ""}]
+                        row_cells.append({
+                            "type": "tableHeader",
+                            "attrs": {},
+                            "content": [{"type": "paragraph", "content": inner}]
+                        })
+                    rows.append({"type": "tableRow", "content": row_cells})
+                elif st == "table_body":
+                    for row in section.get("children", []):
+                        row_cells = []
+                        for cell in row.get("children", []):
+                            inner = _inline(cell.get("children", [])) or [{"type": "text", "text": ""}]
+                            row_cells.append({
+                                "type": "tableCell",
+                                "attrs": {},
+                                "content": [{"type": "paragraph", "content": inner}]
+                            })
+                        rows.append({"type": "tableRow", "content": row_cells})
+            if rows:
+                out.append({
+                    "type": "table",
+                    "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+                    "content": rows
+                })
         elif tok.get("raw"):
             out.append({"type": "paragraph", "content": [{"type": "text", "text": tok["raw"]}]})
     return out
@@ -257,7 +288,7 @@ if not text.strip():
     sys.exit(3)
 try:
     import mistune
-    md = mistune.create_markdown(renderer=None)
+    md = mistune.create_markdown(renderer=None, plugins=['table'])
     content = _blocks(md(text))
 except ImportError:
     sys.stderr.write("jr: mistune not installed — comment sent as plain text. Install with: pip install mistune\n")
@@ -643,8 +674,39 @@ def blocks(tokens):
                 out.append({"type": "orderedList" if ordered else "bulletList", "content": items})
         elif t == "thematic_break":
             out.append({"type": "rule"})
+        elif t == "table":
+            rows = []
+            for section in tok.get("children", []):
+                st = section.get("type")
+                if st == "table_head":
+                    row_cells = []
+                    for cell in section.get("children", []):
+                        inner = inline(cell.get("children", [])) or [{"type": "text", "text": ""}]
+                        row_cells.append({
+                            "type": "tableHeader",
+                            "attrs": {},
+                            "content": [{"type": "paragraph", "content": inner}]
+                        })
+                    rows.append({"type": "tableRow", "content": row_cells})
+                elif st == "table_body":
+                    for row in section.get("children", []):
+                        row_cells = []
+                        for cell in row.get("children", []):
+                            inner = inline(cell.get("children", [])) or [{"type": "text", "text": ""}]
+                            row_cells.append({
+                                "type": "tableCell",
+                                "attrs": {},
+                                "content": [{"type": "paragraph", "content": inner}]
+                            })
+                        rows.append({"type": "tableRow", "content": row_cells})
+            if rows:
+                out.append({
+                    "type": "table",
+                    "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+                    "content": rows
+                })
         elif tok.get("raw"):
-            # Unknown token (tables, fenced code, images): degrade to raw text.
+            # Unknown token (fenced code, images): degrade to raw text.
             out.append({"type": "paragraph", "content": [{"type": "text", "text": tok["raw"]}]})
     return out
 
@@ -686,7 +748,7 @@ def list_items(tokens):
                 items.append({"type": "listItem", "content": inner})
     return items
 
-md = mistune.create_markdown(renderer=None)
+md = mistune.create_markdown(renderer=None, plugins=['table'])
 items = list_items(md(body_md)) if body_md else []
 
 # Fallback: no bullets in the PR body — list the commit subjects instead.
@@ -2484,6 +2546,37 @@ def _blocks(tokens):
         elif t == "block_code":
             code = tok.get("raw", "")
             out.append({"type": "codeBlock", "content": [{"type": "text", "text": code}]})
+        elif t == "table":
+            rows = []
+            for section in tok.get("children", []):
+                st = section.get("type")
+                if st == "table_head":
+                    row_cells = []
+                    for cell in section.get("children", []):
+                        inner = _inline(cell.get("children", [])) or [{"type": "text", "text": ""}]
+                        row_cells.append({
+                            "type": "tableHeader",
+                            "attrs": {},
+                            "content": [{"type": "paragraph", "content": inner}]
+                        })
+                    rows.append({"type": "tableRow", "content": row_cells})
+                elif st == "table_body":
+                    for row in section.get("children", []):
+                        row_cells = []
+                        for cell in row.get("children", []):
+                            inner = _inline(cell.get("children", [])) or [{"type": "text", "text": ""}]
+                            row_cells.append({
+                                "type": "tableCell",
+                                "attrs": {},
+                                "content": [{"type": "paragraph", "content": inner}]
+                            })
+                        rows.append({"type": "tableRow", "content": row_cells})
+            if rows:
+                out.append({
+                    "type": "table",
+                    "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+                    "content": rows
+                })
         elif tok.get("raw"):
             out.append({"type": "paragraph", "content": [{"type": "text", "text": tok["raw"]}]})
     return out
@@ -2493,7 +2586,7 @@ def md_to_adf_doc(text):
         return None
     try:
         import mistune
-        md = mistune.create_markdown(renderer=None)
+        md = mistune.create_markdown(renderer=None, plugins=['table'])
         content = _blocks(md(text))
     except ImportError:
         sys.stderr.write("jr: mistune not installed — body sent as plain text. Install with: pip install mistune\n")
@@ -2819,6 +2912,37 @@ def _blocks(tokens):
         elif t == "block_code":
             code = tok.get("raw", "")
             out.append({"type": "codeBlock", "content": [{"type": "text", "text": code}]})
+        elif t == "table":
+            rows = []
+            for section in tok.get("children", []):
+                st = section.get("type")
+                if st == "table_head":
+                    row_cells = []
+                    for cell in section.get("children", []):
+                        inner = _inline(cell.get("children", [])) or [{"type": "text", "text": ""}]
+                        row_cells.append({
+                            "type": "tableHeader",
+                            "attrs": {},
+                            "content": [{"type": "paragraph", "content": inner}]
+                        })
+                    rows.append({"type": "tableRow", "content": row_cells})
+                elif st == "table_body":
+                    for row in section.get("children", []):
+                        row_cells = []
+                        for cell in row.get("children", []):
+                            inner = _inline(cell.get("children", [])) or [{"type": "text", "text": ""}]
+                            row_cells.append({
+                                "type": "tableCell",
+                                "attrs": {},
+                                "content": [{"type": "paragraph", "content": inner}]
+                            })
+                        rows.append({"type": "tableRow", "content": row_cells})
+            if rows:
+                out.append({
+                    "type": "table",
+                    "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+                    "content": rows
+                })
         elif tok.get("raw"):
             out.append({"type": "paragraph", "content": [{"type": "text", "text": tok["raw"]}]})
     return out
@@ -2828,7 +2952,7 @@ def md_to_adf_doc(text):
         return None
     try:
         import mistune
-        md = mistune.create_markdown(renderer=None)
+        md = mistune.create_markdown(renderer=None, plugins=['table'])
         content = _blocks(md(text))
     except ImportError:
         sys.stderr.write("jr: mistune not installed — body sent as plain text. Install with: pip install mistune\n")
