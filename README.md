@@ -176,8 +176,8 @@ automatically:
 prompts for a duration (e.g. `30m`, `1h`). Press Enter to submit `0m`.
 
 **CapEx** — if Jira rejects a transition (commonly `→ Ready`) because a CapEx
-field is missing, jr prompts `CapEx? [y/N]` and patches the field before
-retrying. Requires `[move.capex]` in `~/.jr.toml`:
+field is missing, jr prompts `CapEx? [y/N]` and sends the field with the
+retried transition. Requires `[move.capex]` in `~/.jr.toml`:
 
 ```toml
 [move.capex]
