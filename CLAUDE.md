@@ -10,11 +10,14 @@ just symlinks `~/bin/jr` → this file.
 
 ```
 jr          the whole program — bash frame + Python heredocs
-install.sh  ln -sf to ~/bin/jr
+jr.ps1      Windows-only PowerShell entry point; delegates to `jr` under bash
+install.sh  ln -sf to ~/bin (jr, plus jr.ps1 on Windows)
 README.md   user-facing docs
 ```
 
-Everything lives in `jr`. When you add a command you edit one file.
+Everything lives in `jr`. When you add a command you edit one file — `jr.ps1`
+never needs touching for a new command (see [The PowerShell
+wrapper](#the-powershell-wrapper-jrps1)).
 
 ---
 
@@ -186,6 +189,8 @@ bash variables set inside the heredoc.
   On Windows with a non-UTF-8 console (cp1252), Python's stdout raises
   `UnicodeEncodeError` on emoji. This is a display-only issue; the API calls
   are unaffected. The fix is `PYTHONUTF8=1` or piping through a UTF-8 terminal.
+  `jr.ps1` sets `PYTHONUTF8=1` for the bash it spawns, so the PowerShell entry
+  point is already covered.
 
 - **`jr resolve` requires `gh` and `mistune`.** Both are checked early and fail
   clearly. Other commands have no extra dependencies.
@@ -193,6 +198,45 @@ bash variables set inside the heredoc.
 - **Transition to In Progress auto-assigns.** If the ticket is unassigned,
   `cmd_move` assigns it to the caller. If it's assigned to someone else, it
   refuses. This is intentional — don't remove it.
+
+---
+
+## The PowerShell wrapper (`jr.ps1`)
+
+Windows-only entry point, installed by `install.sh` beside `~/bin/jr` (the
+`MINGW*|MSYS*|CYGWIN*` arm of the `uname -s` case). PowerShell resolves a bare
+`jr` on PATH to `jr.ps1` ahead of the extensionless `jr`, and the wrapper finds
+the bash script as its own sibling (`$PSScriptRoot\jr`, following the symlink).
+
+**It delegates and nothing else.** No CLI logic belongs there — a new command or
+flag needs no change to `jr.ps1`. What it does own is a handful of
+PowerShell-specific hazards, each already load-bearing:
+
+- **Args travel as env vars** (`JR_PS_ARGC`, `JR_PS_ARG<n>`), not on the bash
+  command line. Windows PowerShell 5.1 drops embedded double quotes when it
+  builds a native command line, which corrupts values like
+  `-F customfield_12533='{"id":"16498"}'`. For the same reason the one `-c`
+  payload PowerShell does pass contains no double quotes of its own; the bash
+  that needs them travels in `JR_PS_BOOT` and is `eval`'d there.
+- **Stdin is forwarded only under `$MyInvocation.ExpectingInput`.** A `.ps1` gets
+  pipeline input itself and must hand it on, but an unconditional `$input |`
+  closes the child's stdin — which EOFs the interactive CapEx / Time Spent
+  prompts in `_jr_do_transition`.
+- **`$ErrorActionPreference = 'Continue'` around the native call.** On 5.1 a
+  child's stderr becomes an error record when the caller redirects it
+  (`jr view X 2>&1`); under `Stop` that aborts the wrapper before it can hand
+  back jr's exit code.
+- **`$OutputEncoding` is set to UTF-8** (script-scoped, so the caller's session
+  is untouched): 5.1 defaults it to ASCII and would mangle non-ASCII text piped
+  into `jr comment`.
+- **bash.exe discovery skips `C:\Windows\System32\bash.exe`** — that's the WSL
+  launcher, whose Linux bash can't run a script at a Windows path. Git for
+  Windows is probed first (via `git.exe`'s install root, then the standard
+  `Program Files` locations), `where.exe bash` last.
+
+Verify wrapper changes on **both** `powershell.exe` (5.1) and `pwsh` (7+) —
+their native-argument, stderr and encoding semantics differ, and 5.1 is the
+strict one.
 
 ---
 
@@ -204,6 +248,15 @@ There is no test suite. Test manually against a real Jira ticket:
 jr transitions MT-XXXXX          # verify a ticket is reachable
 jr view MT-XXXXX                  # smoke test API auth
 bash jr set-field MT-XXXXX CapEx --list-options   # verify editmeta endpoint
+```
+
+For `jr.ps1`, install into a sandboxed `HOME` so the real `~/bin/jr` symlink is
+left alone, and drive it from both PowerShell hosts:
+
+```bash
+HOME=/c/tmp/jrinst bash install.sh          # run twice: must be idempotent
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File suite.ps1  # 5.1
+pwsh -NoProfile -File suite.ps1                                    # 7+
 ```
 
 For ADF changes, `jr create --dry-run` prints the payload JSON without
