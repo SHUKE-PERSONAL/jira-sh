@@ -189,8 +189,10 @@ bash variables set inside the heredoc.
   On Windows with a non-UTF-8 console (cp1252), Python's stdout raises
   `UnicodeEncodeError` on emoji. This is a display-only issue; the API calls
   are unaffected. The fix is `PYTHONUTF8=1` or piping through a UTF-8 terminal.
-  `jr.ps1` sets `PYTHONUTF8=1` for the bash it spawns, so the PowerShell entry
-  point is already covered.
+  `jr.ps1` covers the PowerShell entry point with both halves of that fix:
+  `PYTHONUTF8=1` for the bash it spawns (no crash) plus a UTF-8
+  `[Console]::OutputEncoding` (no mojibake). `PYTHONUTF8` alone only removes the
+  exception — the text still lands garbled.
 
 - **`jr resolve` requires `gh` and `mistune`.** Both are checked early and fail
   clearly. Other commands have no extra dependencies.
@@ -209,15 +211,41 @@ Windows-only entry point, installed by `install.sh` beside `~/bin/jr` (the
 the bash script as its own sibling (`$PSScriptRoot\jr`, following the symlink).
 
 **It delegates and nothing else.** No CLI logic belongs there — a new command or
-flag needs no change to `jr.ps1`. What it does own is a handful of
-PowerShell-specific hazards, each already load-bearing:
+flag needs no change to `jr.ps1`. What it does own is a set of PowerShell- and
+Windows-specific hazards, every one of them load-bearing:
 
-- **Args travel as env vars** (`JR_PS_ARGC`, `JR_PS_ARG<n>`), not on the bash
+- **Args travel as env vars** (`<tag>_ARGC`, `<tag>_ARG<n>`), not on the bash
   command line. Windows PowerShell 5.1 drops embedded double quotes when it
   builds a native command line, which corrupts values like
   `-F customfield_12533='{"id":"16498"}'`. For the same reason the one `-c`
   payload PowerShell does pass contains no double quotes of its own; the bash
-  that needs them travels in `JR_PS_BOOT` and is `eval`'d there.
+  that needs them travels in `<tag>_BOOT` and is `eval`'d there.
+  - `<tag>` is a per-invocation GUID. Two `jr` calls in one PowerShell process
+    (`ForEach-Object -Parallel`, `Start-ThreadJob`) share one environment block,
+    and fixed names let them read each other's arguments — which for `jr move` /
+    `jr assign` means silently acting on the wrong ticket.
+  - The `-c` payload **refuses to run when that env is missing** (exit 126). A
+    bash that drops the Windows environment would otherwise `eval` an empty
+    string and exit 0 with no output — a silent no-op that reads as success.
+  - Args are capped at 32000 chars with a `--body-file` hint. Beyond ~32767 a
+    Windows env var can't hold the value: 5.1 throws a .NET exception that takes
+    the *caller's* script down, 7 gets as far as bash saying `Argument list too
+    long`.
+- **bash.exe discovery is fussy for good reasons.** `C:\Windows\System32\bash.exe`
+  *and* `%LOCALAPPDATA%\Microsoft\WindowsApps\bash.exe` are both WSL launchers,
+  and on a clean Windows PATH they shadow Git's bash. WSL's Linux bash can't open
+  a script at a Windows path and doesn't inherit the environment, so both are
+  filtered out. Then:
+  - `git.exe` is often a **shim** (scoop, chocolatey), so its own directory says
+    nothing about where bash lives — `git --exec-path` is the fallback that
+    answers from the real install.
+  - A candidate at `<root>\usr\bin\bash.exe` is remapped to `<root>\bin\bash.exe`
+    when that exists. The `bin` one is the launcher that sets up the msys
+    environment; `usr\bin\bash.exe` started from Windows inherits only the
+    Windows PATH, where `curl` is System32's and **`bash` itself is WSL**.
+  - The boot script `exec`s the selected bash **by path** (`<tag>_BASH`). A bare
+    `exec bash` re-resolves through PATH and lands on WSL, which then reports
+    `No such file or directory` for the Windows-path script.
 - **Stdin is forwarded only under `$MyInvocation.ExpectingInput`.** A `.ps1` gets
   pipeline input itself and must hand it on, but an unconditional `$input |`
   closes the child's stdin — which EOFs the interactive CapEx / Time Spent
@@ -226,13 +254,22 @@ PowerShell-specific hazards, each already load-bearing:
   child's stderr becomes an error record when the caller redirects it
   (`jr view X 2>&1`); under `Stop` that aborts the wrapper before it can hand
   back jr's exit code.
-- **`$OutputEncoding` is set to UTF-8** (script-scoped, so the caller's session
-  is untouched): 5.1 defaults it to ASCII and would mangle non-ASCII text piped
-  into `jr comment`.
-- **bash.exe discovery skips `C:\Windows\System32\bash.exe`** — that's the WSL
-  launcher, whose Linux bash can't run a script at a Windows path. Git for
-  Windows is probed first (via `git.exe`'s install root, then the standard
-  `Program Files` locations), `where.exe bash` last.
+- **Both encodings are set.** `$OutputEncoding` (script-scoped) covers what
+  PowerShell writes to the child's stdin — 5.1 defaults it to ASCII and would
+  mangle non-ASCII piped into `jr comment`. `[Console]::OutputEncoding` covers
+  the other direction: PowerShell decodes the child's stdout with it, so on a
+  legacy console codepage (cp437, cp1252) jr's UTF-8 — em dashes, ADF emoji —
+  arrives as mojibake. That one is process-global, hence saved and restored.
+
+Two PowerShell behaviours the wrapper **cannot** paper over, both inherent to
+being a `.ps1` rather than an `.exe`:
+
+- On 5.1 a redirected stderr surfaces as a PowerShell error record decorated
+  with the wrapper's own source line. The exit code is still correct.
+- If the caller stops the pipeline early (`jr ls | Select-Object -First 3`), the
+  script is torn down before its `exit` runs, so `$LASTEXITCODE` is left unset or
+  `-1` on a *successful* call. Any `.ps1` behaves this way; there is no code path
+  after a pipeline stop.
 
 Verify wrapper changes on **both** `powershell.exe` (5.1) and `pwsh` (7+) —
 their native-argument, stderr and encoding semantics differ, and 5.1 is the
@@ -258,6 +295,19 @@ HOME=/c/tmp/jrinst bash install.sh          # run twice: must be idempotent
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File suite.ps1  # 5.1
 pwsh -NoProfile -File suite.ps1                                    # 7+
 ```
+
+**The test script must pin PATH to the registry value**, or the test lies. A
+PowerShell launched from Git Bash inherits Git's `mingw64`/`usr\bin` on PATH and
+finds a working bash by accident; a Copilot or VS Code terminal does not, and
+that is the environment where WSL's bash wins. Start `suite.ps1` with:
+
+```powershell
+$env:PATH = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
+            [Environment]::GetEnvironmentVariable('Path','User') + ';C:\tmp\jrinst\bin'
+```
+
+Worth covering: a `-F` JSON arg, an empty arg, a multi-line arg, piped stdin,
+success/failure exit codes, and non-ASCII output bytes.
 
 For ADF changes, `jr create --dry-run` prints the payload JSON without
 creating a ticket; `jr resolve` against a ticket already in Review will

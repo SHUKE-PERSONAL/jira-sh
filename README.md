@@ -36,7 +36,8 @@ Two things have to be set at the **Windows** level, because a PowerShell session
 never reads `~/.bashrc`:
 
 ```powershell
-# 1. ~/bin on the Windows PATH — new PowerShell sessions pick it up
+# 1. ~/bin on the Windows PATH — new PowerShell sessions pick it up. install.sh
+#    prints this exact line with the right path if it isn't there yet.
 [Environment]::SetEnvironmentVariable('Path',
   [Environment]::GetEnvironmentVariable('Path','User') + ";$env:USERPROFILE\bin", 'User')
 
@@ -51,6 +52,12 @@ never reads `~/.bashrc`:
 
 If PowerShell answers *"running scripts is disabled on this system"*, allow
 local scripts once: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+
+Two rough edges of running a `.ps1` rather than a native `.exe`, both on Windows
+PowerShell 5.1 only: a redirected `jr ... 2>&1` shows jr's stderr as a
+PowerShell error record (the message is intact, the exit code is correct), and
+stopping the output pipeline early (`jr ls | Select-Object -First 3`) leaves
+`$LASTEXITCODE` unset even though the call succeeded. PowerShell 7 has neither.
 
 Markdown bodies: prefer `--body-file` so bash reads the file itself. Windows
 PowerShell 5.1's `Get-Content` decodes files as ANSI, which mangles non-ASCII on

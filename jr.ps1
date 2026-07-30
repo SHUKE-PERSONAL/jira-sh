@@ -20,32 +20,61 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 function Write-JrError([string]$msg) { [Console]::Error.WriteLine("jr: $msg") }
 
 # --- locate bash.exe -------------------------------------------------------
-# Git for Windows first: `where.exe bash` can hit C:\Windows\System32\bash.exe,
-# the WSL launcher, whose Linux bash cannot run a script at a Windows path.
-$candidates = @()
+# It has to be a Git for Windows bash. Two traps shape this search:
+#   * C:\Windows\System32\bash.exe AND %LOCALAPPDATA%\Microsoft\WindowsApps\
+#     bash.exe are both WSL launchers, and WSL commonly shadows Git's bash on a
+#     clean PATH. Its Linux bash cannot open a script at a Windows path and does
+#     not inherit the Windows environment, so picking it breaks everything.
+#   * git.exe is frequently a shim (scoop, chocolatey), so its own directory
+#     says nothing about where bash lives - hence the `git --exec-path` probe,
+#     which answers from the real install whatever the shim layout.
+function Test-JrExe([string]$p) { return ($p -and (Test-Path -LiteralPath $p -PathType Leaf)) }
 
+# Git's bin\bash.exe is the launcher that sets up the msys environment - PATH to
+# /usr/bin and /mingw64/bin, so jr finds curl, tr, grep, git. The same bash at
+# usr\bin\bash.exe started straight from Windows gets none of that: it inherits
+# only the Windows PATH, where `bash` itself resolves to WSL. Prefer the launcher.
+function Get-JrBashLauncher([string]$p) {
+    if ($p -match '(?i)^(.*)\\usr\\bin\\bash\.exe$') {
+        $alt = Join-Path $Matches[1] 'bin\bash.exe'
+        if (Test-JrExe $alt) { return $alt }
+    }
+    return $p
+}
+
+$candidates = @()
+foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, "$env:LOCALAPPDATA\Programs")) {
+    if ($root) { $candidates += (Join-Path $root 'Git\bin\bash.exe') }
+}
 $git = Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($git) {
     # <install>\cmd\git.exe or <install>\bin\git.exe -> <install>\bin\bash.exe
     $candidates += (Join-Path (Split-Path (Split-Path $git.Source -Parent) -Parent) 'bin\bash.exe')
 }
-foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, "$env:LOCALAPPDATA\Programs")) {
-    if ($root) { $candidates += (Join-Path $root 'Git\bin\bash.exe') }
-}
 $candidates += @(
-    Get-Command bash.exe -CommandType Application -ErrorAction SilentlyContinue |
-        Where-Object { $_.Source -notmatch '\\Windows\\(System32|SysWOW64|Sysnative)\\' } |
-        ForEach-Object { $_.Source }
+    Get-Command bash.exe -CommandType Application -All -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.Source } |
+        Where-Object { $_ -notmatch '\\Windows\\(System32|SysWOW64|Sysnative)\\' -and
+                       $_ -notmatch '\\Microsoft\\WindowsApps\\' }
 )
 
-$bash = $candidates |
-    Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } |
-    Select-Object -First 1
+$bash = $candidates | Where-Object { Test-JrExe $_ } | Select-Object -First 1
+
+if (-not $bash -and $git) {
+    # <root>\mingw64\libexec\git-core -> <root>\{bin,usr\bin}\bash.exe
+    try { $execPath = @(& $git.Source --exec-path 2>$null)[0] } catch { $execPath = $null }
+    if ($execPath) {
+        $root = Split-Path (Split-Path (Split-Path ($execPath -replace '/', '\') -Parent) -Parent) -Parent
+        $bash = @("$root\bin\bash.exe", "$root\usr\bin\bash.exe") |
+            Where-Object { Test-JrExe $_ } | Select-Object -First 1
+    }
+}
 
 if (-not $bash) {
-    Write-JrError 'cannot find bash.exe. Install Git for Windows (https://git-scm.com/download/win).'
+    Write-JrError 'cannot find a Git for Windows bash.exe (WSL bash will not do). Install Git for Windows: https://git-scm.com/download/win'
     exit 127
 }
+$bash = Get-JrBashLauncher $bash
 
 # --- locate the bash jr script --------------------------------------------
 $jr = Join-Path $PSScriptRoot 'jr'
@@ -70,27 +99,60 @@ if ($target) {
 # command line, which corrupts values like -F customfield_12533='{"id":"16498"}'.
 # An env var reaches the child byte-exact, so every argument survives verbatim.
 # For the same reason the -c payload below contains no double quotes of its own;
-# the bash that does need them is passed in JR_PS_BOOT and eval'd there.
-$boot = 'argv=(); i=0; while [ $i -lt $JR_PS_ARGC ]; do v="JR_PS_ARG$i"; argv+=("${!v}"); i=$((i+1)); done; exec bash "$JR_PS_SCRIPT" "${argv[@]}"'
+# the bash that does need them travels in <tag>_BOOT and is eval'd there.
+#
+# The names carry a per-invocation tag: two jr calls in one PowerShell process
+# (ForEach-Object -Parallel, ThreadJob) share one environment block, and a fixed
+# name would let them read each other's arguments - silently operating on the
+# wrong ticket.
+#
+# jr runs under the bash we picked, named explicitly: a bare `exec bash` would
+# resolve through PATH, and on a clean Windows PATH that is WSL's bash.
+$tag = 'JR' + [guid]::NewGuid().ToString('N')
+$boot = 'argv=(); i=0; while [ $i -lt $%NS%_ARGC ]; do v=%NS%_ARG$i; argv+=("${!v}"); i=$((i+1)); done; exec "$%NS%_BASH" "$%NS%_SCRIPT" "${argv[@]}"'
+$boot = $boot.Replace('%NS%', $tag)
 
-$owned = @('JR_PS_SCRIPT', 'JR_PS_ARGC', 'JR_PS_BOOT')
+# Fixed payload, quote-free. It refuses to run when the handover env is missing,
+# which is what a WSL bash looks like from here: WSL drops the Windows
+# environment, and an unguarded `eval` of nothing would exit 0 with no output -
+# a silent no-op that reads like success to a caller.
+$payload = 'set -f; b=${1}_BOOT; v=${!b}; if [ x${v:+1} = x ]; then echo jr: this bash did not inherit the wrapper environment, probably WSL bash. Install Git for Windows. >&2; exit 126; fi; eval $v'
+
+$owned = @("${tag}_SCRIPT", "${tag}_ARGC", "${tag}_BOOT", "${tag}_BASH")
 $saved = @{}
 foreach ($n in @('PYTHONUTF8')) { $saved[$n] = [Environment]::GetEnvironmentVariable($n) }
+$savedConsoleOut = [Console]::OutputEncoding
 
 $code = 127   # stands if bash never got off the ground
 
 try {
-    [Environment]::SetEnvironmentVariable('JR_PS_SCRIPT', ($jr -replace '\\', '/'))
-    [Environment]::SetEnvironmentVariable('JR_PS_ARGC', [string]$args.Count)
-    [Environment]::SetEnvironmentVariable('JR_PS_BOOT', $boot)
+    [Environment]::SetEnvironmentVariable("${tag}_SCRIPT", ($jr -replace '\\', '/'))
+    [Environment]::SetEnvironmentVariable("${tag}_BASH", ($bash -replace '\\', '/'))
+    [Environment]::SetEnvironmentVariable("${tag}_ARGC", [string]$args.Count)
+    [Environment]::SetEnvironmentVariable("${tag}_BOOT", $boot)
     for ($i = 0; $i -lt $args.Count; $i++) {
-        $name = "JR_PS_ARG$i"
+        $name = "${tag}_ARG$i"
         $owned += $name
-        [Environment]::SetEnvironmentVariable($name, [string]$args[$i])
+        $value = [string]$args[$i]
+        # A Windows environment variable tops out at 32767 chars, and the process
+        # environment as a whole is capped too. Checked here so both hosts give
+        # the same actionable error: 5.1 would throw a raw .NET exception (which
+        # takes the caller's script down with it) and 7 would get as far as bash
+        # answering `Argument list too long`.
+        if ($value.Length -gt 32000) {
+            Write-JrError "argument $($i + 1) is too long ($($value.Length) chars) to pass through the Windows environment. Use --body-file for a large body."
+            exit 1
+        }
+        [Environment]::SetEnvironmentVariable($name, $value)
     }
     # Jira ADF carries emoji; without UTF-8 mode python3 raises
     # UnicodeEncodeError writing them to a legacy-codepage console.
     [Environment]::SetEnvironmentVariable('PYTHONUTF8', '1')
+
+    # PowerShell decodes the child's stdout with [Console]::OutputEncoding; on a
+    # legacy codepage (cp437, cp1252) jr's UTF-8 output - em dashes, emoji from
+    # ADF - arrives as mojibake. This one is process-global, hence the restore.
+    try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { }
 
     # Windows PowerShell 5.1 turns a native command's stderr into an error
     # record whenever the caller redirects it (`jr view X 2>&1`); under 'Stop'
@@ -102,9 +164,9 @@ try {
         # explicitly. Only when there is input: an unconditional `$input |`
         # closes stdin at once, which would EOF jr's interactive prompts
         # (CapEx, Time Spent).
-        $input | & $bash --noprofile --norc -c 'set -f; eval $JR_PS_BOOT'
+        $input | & $bash --noprofile --norc -c $payload 'jr.ps1' $tag
     } else {
-        & $bash --noprofile --norc -c 'set -f; eval $JR_PS_BOOT'
+        & $bash --noprofile --norc -c $payload 'jr.ps1' $tag
     }
     if ($null -ne $LASTEXITCODE) { $code = $LASTEXITCODE }
 }
@@ -115,6 +177,7 @@ finally {
         if ($null -eq $saved[$n]) { Remove-Item -LiteralPath "env:$n" -ErrorAction SilentlyContinue }
         else { [Environment]::SetEnvironmentVariable($n, $saved[$n]) }
     }
+    try { [Console]::OutputEncoding = $savedConsoleOut } catch { }
 }
 
 exit $code

@@ -28,19 +28,30 @@ fi
 # a fresh PowerShell would inherit — the user + machine Environment keys.
 # (`//v` survives MSYS path mangling; a bare `/v` becomes a filesystem path.)
 _jr_win_path_has_bin() {
-  local reg winbin up
+  local reg winbin up entry
   # Compare in one normal form — lowercase, forward slashes — so neither case
   # nor separator style can hide a match, and so the %USERPROFILE% expansion
-  # below has no backslashes to be misread as escapes.
+  # below has no backslashes to be misread as escapes. sed keeps only the value
+  # after the REG_SZ/REG_EXPAND_SZ column.
   reg=$( { reg.exe query "HKCU\\Environment" //v Path 2>/dev/null
            reg.exe query "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment" //v Path 2>/dev/null
-         } | tr -d '\r' | tr '[:upper:]' '[:lower:]' | tr '\\' '/' )
+         } | tr -d '\r' | sed -n 's/.*REG_\(EXPAND_\)\?SZ[[:space:]]*//p' \
+           | tr '[:upper:]' '[:lower:]' | tr '\\' '/' )
   [[ -n "$reg" ]] || return 1
   up=$(printf '%s' "${USERPROFILE:-}" | tr '[:upper:]' '[:lower:]' | tr '\\' '/')
   # PATH entries are commonly stored unexpanded
   [[ -n "$up" ]] && reg=${reg//'%userprofile%'/$up}
   winbin=$(cygpath -m "$BIN" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-  [[ -n "$winbin" && "$reg" == *"$winbin"* ]]
+  [[ -n "$winbin" ]] || return 1
+  winbin=${winbin%/}
+  # Whole entries only: a substring test would accept C:\Users\x\binaries as a
+  # match for C:\Users\x\bin, and C:\Program Files\GitHub CLI for ...\Git.
+  local IFS=$';\n'
+  for entry in $reg; do
+    [[ "$entry" =~ ^[[:space:]]*(.*[^[:space:]])[[:space:]]*$ ]] && entry=${BASH_REMATCH[1]}
+    [[ "${entry%/}" == "$winbin" ]] && return 0
+  done
+  return 1
 }
 
 case "$(uname -s)" in
