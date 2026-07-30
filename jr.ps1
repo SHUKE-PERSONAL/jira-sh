@@ -133,7 +133,12 @@ try {
     for ($i = 0; $i -lt $args.Count; $i++) {
         $name = "${tag}_ARG$i"
         $owned += $name
-        $value = [string]$args[$i]
+        # PowerShell parses an unquoted a,b into an array before this script sees
+        # it; a native exe would have received the literal a,b. Rejoin so
+        # -F customfield_X=a,b reaches jr the way it was typed. ([string] on an
+        # array would join with spaces instead.)
+        $value = if ($args[$i] -is [array]) { ($args[$i] | ForEach-Object { [string]$_ }) -join ',' }
+                 else { [string]$args[$i] }
         # A Windows environment variable tops out at 32767 chars, and the process
         # environment as a whole is capped too. Checked here so both hosts give
         # the same actionable error: 5.1 would throw a raw .NET exception (which
