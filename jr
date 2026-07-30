@@ -106,13 +106,18 @@ _jr_api_status() {
 # Transitions to "Ready" may also require a CapEx field; configure it in
 # ~/.jr.toml under [move.capex] with field, yes_value, and no_value keys.
 _jr_do_transition() {
-  local ticket=$1 tid=$2 status=$3
+  local ticket=$1 tid=$2 status=$3 from_status=${4:-}
+  # Validators hang off one transition path, not off the destination status, so
+  # name both endpoints. Falls back to the target alone when the caller could
+  # not determine the current status.
+  local move_desc="to '$status'"
+  [[ -n "$from_status" ]] && move_desc="from '$from_status' to '$status'"
   local resp code body
   resp=$(_jr_api_status POST "/issue/$ticket/transitions" "{\"transition\":{\"id\":\"$tid\"}}")
   code=${resp##*$'\n'}; body=${resp%$'\n'*}
   if [[ ! "$code" =~ ^2 ]] && echo "$body" | grep -qi "time spent"; then
     local spent
-    read -r -p "$status requires a Time Spent (e.g. 30m, 1h). [Enter = 0m to bypass]: " spent
+    read -r -p "Moving $move_desc requires logging a Time Spent (e.g. 30m, 1h). [Enter = 0m to bypass]: " spent
     spent=${spent:-0m}
     resp=$(_jr_api_status POST "/issue/$ticket/transitions" \
       "{\"transition\":{\"id\":\"$tid\"},\"update\":{\"worklog\":[{\"add\":{\"timeSpent\":\"$spent\"}}]}}")
@@ -139,7 +144,7 @@ except Exception:
     print('No')
 ")
     if [[ -z "$capex_field" ]]; then
-      echo "jr: '$status' requires a CapEx field. Add to ~/.jr.toml:" >&2
+      echo "jr: moving $move_desc requires a CapEx field. Add to ~/.jr.toml:" >&2
       echo "    [move.capex]" >&2
       echo "    field     = \"customfield_XXXXX\"  # CapEx custom field ID" >&2
       echo "    yes_value = \"Yes\"                # optional, default Yes" >&2
@@ -344,12 +349,17 @@ for t in json.loads(sys.stdin.read()).get('transitions', []):
   esac
 
   # Current assignee — accountId is reliable even when Jira hides the email.
-  local a_id a_email
-  { read -r a_id; read -r a_email; } < <(_jr_api GET "/issue/$ticket?fields=assignee" | python3 -c "
+  # The same GET carries the current status, so the transition prompts can name
+  # where the move starts from without a second round-trip.
+  local a_id a_email cur_status
+  { read -r a_id; read -r a_email; read -r cur_status; } < <(_jr_api GET "/issue/$ticket?fields=assignee,status" | python3 -c "
 import json, sys
-a = json.loads(sys.stdin.read()).get('fields', {}).get('assignee') or {}
+f = json.loads(sys.stdin.read()).get('fields', {})
+a = f.get('assignee') or {}
+s = f.get('status') or {}
 print(a.get('accountId', ''))
 print(a.get('emailAddress', ''))
+print(s.get('name', ''))
 ")
 
   # Identify the current user by accountId — reliable even when Jira hides the
@@ -376,7 +386,7 @@ print(a.get('emailAddress', ''))
     [[ "${confirm,,}" == "y" ]] || { echo "aborted." >&2; return 1; }
   fi
 
-  _jr_do_transition "$ticket" "$tid" "$dest" || return 1
+  _jr_do_transition "$ticket" "$tid" "$dest" "$cur_status" || return 1
   echo "$ticket → $dest"
 }
 
