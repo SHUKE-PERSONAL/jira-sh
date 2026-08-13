@@ -2,7 +2,7 @@
 
 `jr` is a **single bash file** (`./jr`) with Python embedded as `<<'PYEOF'` heredocs.
 No build step, no dependencies beyond bash + curl + python3. The install script
-just symlinks `~/bin/jr` → this file.
+just symlinks `~/.local/bin/jr` → this file.
 
 ---
 
@@ -11,7 +11,7 @@ just symlinks `~/bin/jr` → this file.
 ```
 jr          the whole program — bash frame + Python heredocs
 jr.ps1      Windows-only PowerShell entry point; delegates to `jr` under bash
-install.sh  ln -sf to ~/bin (jr, plus jr.ps1 on Windows)
+install.sh  ln -sf to ~/.local/bin (jr, plus jr.ps1 on Windows)
 README.md   user-facing docs
 ```
 
@@ -205,7 +205,7 @@ bash variables set inside the heredoc.
 
 ## The PowerShell wrapper (`jr.ps1`)
 
-Windows-only entry point, installed by `install.sh` beside `~/bin/jr` (the
+Windows-only entry point, installed by `install.sh` beside `~/.local/bin/jr` (the
 `MINGW*|MSYS*|CYGWIN*` arm of the `uname -s` case). PowerShell resolves a bare
 `jr` on PATH to `jr.ps1` ahead of the extensionless `jr`, and the wrapper finds
 the bash script as its own sibling (`$PSScriptRoot\jr`, following the symlink).
@@ -287,7 +287,7 @@ jr view MT-XXXXX                  # smoke test API auth
 bash jr set-field MT-XXXXX CapEx --list-options   # verify editmeta endpoint
 ```
 
-For `jr.ps1`, install into a sandboxed `HOME` so the real `~/bin/jr` symlink is
+For `jr.ps1`, install into a sandboxed `HOME` so the real `~/.local/bin/jr` symlink is
 left alone, and drive it from both PowerShell hosts:
 
 ```bash

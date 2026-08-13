@@ -8,7 +8,7 @@ A minimal bash CLI for Jira Cloud. One command: `jr`.
 # 1. Clone
 git clone https://github.com/shukebeta/jira-sh ~/Projects/jira-sh
 
-# 2. Install (symlinks ~/bin/jr; on Windows also ~/bin/jr.ps1)
+# 2. Install (symlinks ~/.local/bin/jr; on Windows also ~/.local/bin/jr.ps1)
 bash ~/Projects/jira-sh/install.sh
 
 # 3. Set env vars in ~/.bashrc
@@ -25,7 +25,7 @@ source ~/.bashrc
 ### Windows: running `jr` from PowerShell
 
 `jr` is a bash script, so PowerShell can't run it directly. On Windows
-`install.sh` also installs **`jr.ps1`** beside `~/bin/jr` — a thin wrapper that
+`install.sh` also installs **`jr.ps1`** beside `~/.local/bin/jr` — a thin wrapper that
 runs the bash `jr` under Git Bash and forwards arguments, stdin, output and the
 exit code. PowerShell resolves a bare `jr` to it, so `jr view PROJ-123` works
 from a PowerShell prompt and from anything that shells out to PowerShell (e.g.
@@ -36,10 +36,10 @@ Two things have to be set at the **Windows** level, because a PowerShell session
 never reads `~/.bashrc`:
 
 ```powershell
-# 1. ~/bin on the Windows PATH — new PowerShell sessions pick it up. install.sh
+# 1. ~/.local/bin on the Windows PATH — new PowerShell sessions pick it up. install.sh
 #    prints this exact line with the right path if it isn't there yet.
 [Environment]::SetEnvironmentVariable('Path',
-  [Environment]::GetEnvironmentVariable('Path','User') + ";$env:USERPROFILE\bin", 'User')
+  [Environment]::GetEnvironmentVariable('Path','User') + ";$env:USERPROFILE\.local\bin", 'User')
 
 # 2. the JIRA_* vars as Windows *user* env vars. bash inherits them; a
 #    non-interactive bash does not source ~/.bashrc, so exports there never
