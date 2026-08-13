@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="$HOME/bin"
+BIN="$HOME/.local/bin"
 TARGET="$BIN/jr"
 
 chmod +x "$SCRIPT_DIR/jr"
@@ -14,7 +14,7 @@ else
   echo "Installed: $TARGET"
   if [[ ":$PATH:" != *":$BIN:"* ]]; then
     echo "  Note: add $BIN to your PATH if not already set"
-    echo "    echo 'export PATH=\"\$HOME/bin:\$PATH\"' >> ~/.bashrc"
+    echo "    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc"
   fi
 fi
 
