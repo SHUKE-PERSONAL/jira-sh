@@ -101,8 +101,8 @@ _jr_api_status() {
 }
 
 # POST a transition, reporting real failures. Some transitions enforce a
-# "Time Spent" validator; we then prompt for the time to log (Jira's documented
-# bypass is 0m, which is the default if you just press Enter).
+# "Time Spent" validator; we then prompt for the time to log (0.1m is the
+# default if you just press Enter).
 # Transitions to "Ready" may also require a CapEx field; configure it in
 # ~/.jr.toml under [move.capex] with field, yes_value, and no_value keys.
 _jr_do_transition() {
@@ -117,8 +117,8 @@ _jr_do_transition() {
   code=${resp##*$'\n'}; body=${resp%$'\n'*}
   if [[ ! "$code" =~ ^2 ]] && echo "$body" | grep -qi "time spent"; then
     local spent
-    read -r -p "Moving $move_desc requires logging a Time Spent (e.g. 30m, 1h). [Enter = 0m to bypass]: " spent
-    spent=${spent:-0m}
+    read -r -p "Moving $move_desc requires logging a Time Spent (e.g. 30m, 1h). [Enter = 0.1m]: " spent
+    spent=${spent:-0.1m}
     resp=$(_jr_api_status POST "/issue/$ticket/transitions" \
       "{\"transition\":{\"id\":\"$tid\"},\"update\":{\"worklog\":[{\"add\":{\"timeSpent\":\"$spent\"}}]}}")
     code=${resp##*$'\n'}; body=${resp%$'\n'*}

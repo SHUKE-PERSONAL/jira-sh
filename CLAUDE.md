@@ -59,7 +59,7 @@ All status moves go through this function. It handles two special validators
 that Jira enforces at transition time:
 
 1. **Time Spent** — if the 4xx body contains `"time spent"` (case-insensitive),
-   prompt for a duration, default `0m`, retry with `update.worklog`.
+   prompt for a duration, default `0.1m`, retry with `update.worklog`.
 
 2. **CapEx** — if the 4xx body contains `"capex"`, read `[move.capex]` from
    `~/.jr.toml`, prompt `y/N`, retry with the value inside `fields` (not

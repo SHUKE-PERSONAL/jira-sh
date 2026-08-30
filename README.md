@@ -219,7 +219,7 @@ Some workflow transitions enforce required fields. `jr move` handles two
 automatically:
 
 **Time Spent** — if Jira rejects the transition with a "time spent" error, jr
-prompts for a duration (e.g. `30m`, `1h`). Press Enter to submit `0m`.
+prompts for a duration (e.g. `30m`, `1h`). Press Enter to submit `0.1m`.
 
 **CapEx** — if Jira rejects a transition (commonly `→ Ready`) because a CapEx
 field is missing, jr prompts `CapEx? [y/N]` and sends the field with the
