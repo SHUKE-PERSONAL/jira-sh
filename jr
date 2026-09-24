@@ -91,6 +91,25 @@ _jr_api() {
   fi
 }
 
+# Binary-capable download: writes the response body to the file named by $3 and
+# prints "<http-code> <curl-exit-code>" on stdout (code is 000 when no response
+# arrived). Sends no Accept header — the JSON-only "Accept: application/json"
+# gets HTTP 406 from Jira's binary endpoints (e.g. /attachment/content/{id}) —
+# and no -f, so the caller branches on both numbers: the HTTP code alone is not
+# enough, because a transfer that dies mid-body (exit 18/23/28) still reports
+# the 2xx it received, and the -o file is then truncated. Follows redirects
+# (curl stops forwarding the Authorization header when a redirect crosses
+# hosts); -S keeps curl's own reason on stderr for transport failures.
+_jr_api_binary() {
+  local method=$1 path=$2 outfile=$3
+  local url="$JIRA_BASE/rest/api/3$path"
+  local auth code rc=0
+  auth=$(_jr_auth)
+  code=$(curl -sS -L -o "$outfile" -w '%{http_code}' -X "$method" \
+    -H "Authorization: Basic $auth" "$url") || rc=$?
+  echo "${code:-000} $rc"
+}
+
 # Like _jr_api but without -f: emits the response body followed by a final
 # line containing the HTTP status code, so callers can inspect both.
 _jr_api_status() {
@@ -2054,7 +2073,7 @@ cmd_view() {
   ticket=$(_jr_resolve_ticket "${1:-.}") || return 1
 
   local issue
-  issue=$(_jr_api GET "/issue/$ticket?fields=summary,status,issuetype,priority,assignee,reporter,labels,description") || {
+  issue=$(_jr_api GET "/issue/$ticket?fields=summary,status,issuetype,priority,assignee,reporter,labels,description,attachment") || {
     echo "jr: ticket not found: $ticket" >&2; return 1; }
 
   echo "$issue" | JIRA_BASE="$JIRA_BASE" KEY="$ticket" JR_OUTPUT_JSON="${JR_OUTPUT_JSON:-}" python3 -c "$(cat <<'PYEOF'
@@ -2077,6 +2096,26 @@ prio     = fv(f, 'priority', 'name') or ''
 assignee = fv(f, 'assignee', 'displayName') or 'Unassigned'
 reporter = fv(f, 'reporter', 'displayName') or ''
 labels   = f.get('labels') or []
+
+# ---- attachments (read-only; download one with `jr attachment`) ----
+attachments = []
+for a in f.get('attachment') or []:
+    attachments.append({
+        'id':       a.get('id') or '',
+        'filename': a.get('filename') or '',
+        'mimeType': a.get('mimeType') or '',
+        'size':     a.get('size') or 0,
+        'content':  a.get('content') or '',
+    })
+
+def human_size(n):
+    try: n = int(n)
+    except (TypeError, ValueError): return '?'
+    if n < 1024: return '%d B' % n
+    for unit in ('KB', 'MB', 'GB'):
+        n /= 1024.0
+        if n < 1024 or unit == 'GB':
+            return '%.1f %s' % (n, unit)
 
 # ---- ADF -> readable markdown ----
 def wrap(text, marks):
@@ -2172,6 +2211,7 @@ if os.environ.get('JR_OUTPUT_JSON') == '1':
         'labels':      labels,
         'url':         '%s/browse/%s' % (base, key),
         'description': desc_text,
+        'attachments': attachments,
     }, indent=2))
     sys.exit(0)
 
@@ -2188,8 +2228,88 @@ print('  URL       %s/browse/%s' % (base, key))
 print()
 print('Description')
 print(desc_text if desc_text else ('  (empty)' if isinstance(desc, dict) else '  (no description)'))
+if attachments:
+    print()
+    print('Attachments')
+    for a in attachments:
+        print('  %s  %s' % (a['id'], a['filename']))
+        print('    %s  %s' % (a['mimeType'] or '?', human_size(a['size'])))
+        print('    %s' % a['content'])
 PYEOF
 )"
+}
+
+# Download one attachment of a ticket to a local file. The selector is the
+# attachment id or its filename (must be unique on the ticket). Read-only —
+# upload and delete are deliberately not supported.
+cmd_attachment() {
+  local usage="Usage: jr attachment <TICKET> <ID|FILENAME> --output <PATH>"
+  local ticket="${1:-}" sel="${2:-}" out=""
+  shift 2 2>/dev/null || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output|-o)
+        [[ $# -lt 2 ]] && { echo "$usage" >&2; return 1; }
+        out=$2; shift 2 ;;
+      *) echo "jr: unknown argument: $1" >&2; echo "$usage" >&2; return 1 ;;
+    esac
+  done
+  [[ -z "$sel" || -z "$out" ]] && { echo "$usage" >&2; return 1; }
+
+  ticket=$(_jr_resolve_ticket "$ticket") || return 1
+
+  local att_json
+  att_json=$(_jr_api GET "/issue/$ticket?fields=attachment") || {
+    echo "jr: ticket not found: $ticket" >&2; return 1; }
+
+  # Pick from the ticket's own attachment list: exact id, then exact filename,
+  # then a unique case-insensitive filename match. Prints "<id>\t<filename>".
+  local picked
+  picked=$(printf '%s' "$att_json" | ATTACH_SEL="$sel" ATTACH_TICKET="$ticket" python3 -c "$(cat <<'PYEOF'
+import json, os, sys
+
+sel = os.environ['ATTACH_SEL']
+ticket = os.environ['ATTACH_TICKET']
+atts = json.load(sys.stdin).get('fields', {}).get('attachment') or []
+
+if not atts:
+    print('jr: ticket %s has no attachments' % ticket, file=sys.stderr)
+    sys.exit(3)
+
+hits = [a for a in atts if a.get('id') == sel]
+if not hits:
+    hits = [a for a in atts if a.get('filename') == sel]
+if not hits:
+    hits = [a for a in atts if (a.get('filename') or '').lower() == sel.lower()]
+
+if len(hits) > 1:
+    print('jr: selector "%s" is ambiguous, %d attachments match; use the id:' % (sel, len(hits)), file=sys.stderr)
+    for a in hits:
+        print('jr:   %s  %s' % (a.get('id'), a.get('filename')), file=sys.stderr)
+    sys.exit(4)
+if not hits:
+    print('jr: no attachment matching "%s" on %s; attachments:' % (sel, ticket), file=sys.stderr)
+    for a in atts:
+        print('jr:   %s  %s' % (a.get('id'), a.get('filename')), file=sys.stderr)
+    sys.exit(5)
+print('%s\t%s' % (hits[0].get('id'), hits[0].get('filename')))
+PYEOF
+)") || return 1
+
+  local aid=${picked%%$'\t'*} fname=${picked#*$'\t'}
+
+  # Binary content: no Accept header, body straight to the file (never through
+  # stdout — keeps bytes intact under jr.ps1). A non-zero curl exit means the
+  # transfer broke (possibly after a 2xx header), so the file is truncated.
+  local code rc
+  read -r code rc <<< "$(_jr_api_binary GET "/attachment/content/$aid" "$out")"
+  if [[ "${rc:-0}" != 0 || "$code" != 2* ]]; then
+    echo "jr: attachment download failed (HTTP ${code:-000}${rc:+, curl exit $rc})" >&2
+    if [[ -s "$out" ]]; then head -c 500 "$out" >&2; echo >&2; fi
+    rm -f "$out"
+    return 1
+  fi
+  echo "jr: saved $fname ($aid) to $out ($(wc -c < "$out" | tr -d ' ') bytes)"
 }
 
 cmd_create() {
@@ -3085,6 +3205,12 @@ Commands:
                                   Update the title and/or body of a ticket you reported; --force/-f edits any ticket
   open        [-p] [TICKET]       Open ticket in the browser (-p / --print to only echo the URL)
   view        [TICKET]            Show a ticket's fields and full description (rendered) — enough to understand the task + A/C
+                                  Lists the ticket's attachments (id, filename, type, size, download URL); --json puts
+                                  them in an "attachments" array.
+  attachment  <TICKET> <ID|FILENAME> --output <PATH>
+                                  Download one attachment to PATH (read-only; no upload/delete). The selector is the
+                                  attachment id from `jr view`, or its filename if unique on the ticket. Missing or
+                                  ambiguous selectors and HTTP errors fail with a non-zero exit.
   set-field   <TICKET> <FIELD> <VALUE|--list-options>
                                 Set a custom field on a ticket via the Edit screen. FIELD accepts a
                                 customfield_XXXXX ID or a case-insensitive name (e.g. Priority).
@@ -3152,6 +3278,7 @@ case "$cmd" in
   edit)           cmd_edit        "$@" ;;
   open)           cmd_open        "$@" ;;
   view)           cmd_view        "$@" ;;
+  attachment)     cmd_attachment  "$@" ;;
   set-field|sf)   cmd_set_field   "$@" ;;
   transitions)    cmd_transitions "$@" ;;
   assign)         cmd_assign      "$@" ;;

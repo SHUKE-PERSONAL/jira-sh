@@ -78,6 +78,7 @@ jr comment PROJ-123 "Deployed to staging"
 jr comment PROJ-123 --body-file report.md      # markdown → native ADF
 cat report.md | jr comment PROJ-123            # ...or from stdin
 jr view PROJ-123
+jr attachment PROJ-123 2739501 --output sample.xml   # download one attachment
 jr help
 ```
 
@@ -86,7 +87,8 @@ branch name (e.g. on `feature/mt-63504` you can just run `jr view`). A bare
 number (`jr view 63504`) is resolved against `JIRA_PROJECT_PREFIXES`.
 
 `--json` is a global flag: on `search`/`ls` it emits a JSON array, on `view` a
-single object, on `create` the `{key,url}` of the new ticket — pipe it to `jq`
+single object (with an `attachments` array), on `create` the `{key,url}` of the
+new ticket — pipe it to `jq`
 (`jr ls --json | jq -r '.[].key'`). Human-rendered output is the default.
 
 ## Commands
@@ -99,7 +101,8 @@ single object, on `create` the `{key,url}` of the new ticket — pipe it to `jq`
 | `start [TICKET]` | Start work: reach In Progress in one hop, or via Ready when Jira blocks the direct jump. Claims the ticket; handles the CapEx gate. |
 | `move <TICKET> <STATUS>` | Transition a ticket (moving to In Progress claims it for you; errors if owned by someone else). |
 | `comment <TICKET> [TEXT]` | Add a comment. Markdown (headings, code, lists, bold, inline code) renders as native ADF. Body from `TEXT`, `--body-file <path>`, or stdin. |
-| `view [TICKET]` | Show a ticket's fields and full rendered description. |
+| `view [TICKET]` | Show a ticket's fields and full rendered description, plus its attachments (id, filename, type, size, download URL). `--json` carries them in an `attachments` array. |
+| `attachment <TICKET> <ID\|FILENAME> --output <PATH>` | Download one attachment (read-only — no upload/delete). Selector is the attachment id or its unique filename; see [Attachments](#attachments). |
 | `resolve [--force] [TICKET]` | Move to review, then fill the review template comment from the current branch's PR. |
 | `approve [--force] [--no-sql] [--no-jenkins] [TICKET]` | Finish review, then fill the Code Review Checklist (see below). |
 | `merge [--force] [TICKET]` | Merge the approved PR, move Merge → Test in Main, then fill the Merge Results template. |
@@ -110,6 +113,27 @@ single object, on `create` the `{key,url}` of the new ticket — pipe it to `jq`
 | `assign [TICKET] [NAME]` | Assign to a user (fuzzy name/email match); NAME omitted = assign to yourself; TICKET omitted = current branch. |
 | `assign -u\|--unassign [TICKET]` | Clear the assignee. |
 | `users <TICKET> [query]` | List assignable users. |
+
+## Attachments
+
+`jr view` lists each attachment with its id, filename, MIME type, size and
+download URL; `jr view --json` carries the same list in an `attachments` array.
+Download one with:
+
+```bash
+jr attachment PROJ-123 2739501 --output sample.xml      # by id (never ambiguous)
+jr attachment PROJ-123 sample.xml --output sample.xml   # by filename (must be unique)
+```
+
+The selector is the attachment id or its filename — exact match first, then a
+unique case-insensitive match; an ambiguous selector is rejected. The download
+goes through `/rest/api/3/attachment/content/{id}` with a binary-safe helper
+that sends no `Accept: application/json` header (that header gets HTTP 406 from
+the endpoint) and writes bytes straight to the output file, so they never pass
+through stdout — which is also what keeps `jr.ps1` from corrupting them.
+Missing selectors, ambiguous filenames, HTTP errors, and transfers that break
+mid-download all fail with a non-zero exit and leave no partial output file.
+Upload and delete are out of scope; manage those in the Jira UI.
 
 ## Review workflow
 
