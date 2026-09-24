@@ -53,6 +53,33 @@ in the bash frame must run with no Python state.
 Use `_jr_api_status` whenever the caller needs to inspect the response code
 (transitions, comment writes, set-field). Use `_jr_api` for everything else.
 
+### `_jr_api_binary`
+
+Binary download helper, used by `jr attachment`. `curl -s -L -o <file>
+-w '%{http_code}'` with only the Authorization header: the body goes straight
+to the file (never through stdout — that is what keeps the bytes intact under
+`jr.ps1`), and the HTTP code (000 on transport failure) goes to stdout so the
+caller branches. It sends **no** `Accept` header and no `-f` — both JSON
+helpers always send `Accept: application/json`, and Jira's binary
+`/attachment/content/{id}` endpoint answers that with **406**.
+
+### Attachments (`jr view`, `jr attachment`)
+
+Read-only by design — no upload, no delete. `jr view` requests the `attachment`
+field and renders an `Attachments` section (id, filename, MIME type, size,
+content URL); `--json` adds the same list as an `attachments` array with
+integer-byte `size`. `jr attachment <TICKET> <ID|FILENAME> --output <PATH>`
+resolves the selector against the ticket's own attachment list (exact id →
+exact filename → unique case-insensitive filename; more than one match is an
+"ambiguous" error) and downloads through `_jr_api_binary`. Failures — missing
+selector, ambiguity, non-2xx, transport — exit non-zero, print the diagnostic,
+and delete the partial output file.
+
+Note: an ADF `media` node's `attrs.id` is a media-API UUID, **not** the
+attachment id, and the basic-auth REST API exposes no UUID→attachment mapping —
+so rendered descriptions keep showing bare `[media]` even when the same file is
+listed under Attachments. Don't "fix" this by matching ids.
+
 ### `_jr_do_transition` (lines ~105–168)
 
 All status moves go through this function. It handles two special validators
@@ -175,6 +202,12 @@ bash variables set inside the heredoc.
 - **CapEx is transition-screen only.** `set-field` uses `PATCH /issue/{ticket}`
   (edit endpoint), which rejects transition-screen fields with 400. `jr move`
   injects them via the transition `fields` body instead.
+
+- **Binary endpoints must not receive `Accept: application/json`.**
+  `_jr_api`/`_jr_api_status` hardcode that header and Jira's
+  `/rest/api/3/attachment/content/{id}` returns 406 for it. Any binary download
+  goes through `_jr_api_binary`, which sends no `Accept` header and writes the
+  body with curl's `-o` — never to stdout, or `jr.ps1` mangles the bytes.
 
 - **Four ADF converters, not one.** They diverged intentionally (different
   template shapes), but the `code`+`strong`/`em` guard must be kept in sync
