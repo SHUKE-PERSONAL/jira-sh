@@ -72,6 +72,9 @@ print(d.get('displayName', ''))
 "
 }
 
+# The request body goes to curl via stdin (--data-binary @-), never as an argv
+# element: on Windows a large ADF body as argv overflows the ~32K CreateProcess
+# command line and the spawn fails with WinError 206.
 _jr_api() {
   local method=$1 path=$2 data=${3:-}
   local url="$JIRA_BASE/rest/api/3$path"
@@ -81,8 +84,11 @@ _jr_api() {
     -H "Authorization: Basic $auth"
     -H "Content-Type: application/json"
     -H "Accept: application/json")
-  [[ -n "$data" ]] && args+=(-d "$data")
-  curl "${args[@]}" "$url"
+  if [[ -n "$data" ]]; then
+    printf '%s' "$data" | curl "${args[@]}" --data-binary @- "$url"
+  else
+    curl "${args[@]}" "$url"
+  fi
 }
 
 # Like _jr_api but without -f: emits the response body followed by a final
@@ -96,8 +102,11 @@ _jr_api_status() {
     -H "Authorization: Basic $auth"
     -H "Content-Type: application/json"
     -H "Accept: application/json")
-  [[ -n "$data" ]] && args+=(-d "$data")
-  curl "${args[@]}" "$url"
+  if [[ -n "$data" ]]; then
+    printf '%s' "$data" | curl "${args[@]}" --data-binary @- "$url"
+  else
+    curl "${args[@]}" "$url"
+  fi
 }
 
 # POST a transition, reporting real failures. Some transitions enforce a
@@ -1753,14 +1762,16 @@ limit = int(os.environ.get("JR_LIMIT") or "50")
 as_json = os.environ.get("JR_OUTPUT_JSON") == "1"
 
 def post(path, payload):
+    # Body via stdin, not argv: a large payload as argv overflows the Windows
+    # ~32K command line (WinError 206).
     r = subprocess.run(
         ["curl", "-s", "-w", "\n%{http_code}", "-X", "POST",
          "--user", f"{email}:{token}",
          "-H", "Content-Type: application/json",
          "-H", "Accept: application/json",
-         "-d", json.dumps(payload),
+         "--data-binary", "@-",
          f"{base}/rest/api/3{path}"],
-        capture_output=True, text=True)
+        input=json.dumps(payload), capture_output=True, text=True)
     lines = r.stdout.rsplit("\n", 1)
     return (lines[1] if len(lines) > 1 else "0"), lines[0]
 
@@ -2744,14 +2755,16 @@ if dry_run:
     sys.exit(0)
 
 # ── POST /issue ───────────────────────────────────────────────────────────────
+# Body via stdin, not argv: a large ADF description as argv overflows the
+# Windows ~32K command line (WinError 206).
 r = subprocess.run(
     ["curl", "-s", "-w", "\n%{http_code}", "-X", "POST",
      "--user", f"{email}:{token}",
      "-H", "Content-Type: application/json",
      "-H", "Accept: application/json",
-     "-d", json.dumps(payload),
+     "--data-binary", "@-",
      f"{base_url}/rest/api/3/issue"],
-    capture_output=True, text=True,
+    input=json.dumps(payload), capture_output=True, text=True,
 )
 lines = r.stdout.rsplit("\n", 1)
 body, code = lines[0], (lines[1] if len(lines) > 1 else "0")
@@ -2829,10 +2842,14 @@ def _curl(method, path, data=None, agile=False):
     cmd = ["curl", "-s", "-w", "\n%{http_code}", "-X", method,
            "--user", f"{email}:{token}",
            "-H", "Accept: application/json"]
+    # Body via stdin, not argv: a large ADF body as argv overflows the Windows
+    # ~32K command line (WinError 206).
     if data is not None:
-        cmd += ["-H", "Content-Type: application/json", "-d", json.dumps(data)]
+        cmd += ["-H", "Content-Type: application/json",
+                "--data-binary", "@-"]
     cmd.append(f"{base_url}{root}{path}")
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True,
+                       input=None if data is None else json.dumps(data))
     lines = r.stdout.rsplit("\n", 1)
     body, code = lines[0], (lines[1] if len(lines) > 1 else "0")
     return int(code), body
