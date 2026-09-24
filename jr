@@ -92,18 +92,22 @@ _jr_api() {
 }
 
 # Binary-capable download: writes the response body to the file named by $3 and
-# prints the HTTP status code on stdout (000 on transport failure). Sends no
-# Accept header — the JSON-only "Accept: application/json" gets HTTP 406 from
-# Jira's binary endpoints (e.g. /attachment/content/{id}) — and no -f, so the
-# caller can branch on the code. Follows redirects (curl stops forwarding the
-# Authorization header when a redirect crosses hosts).
+# prints "<http-code> <curl-exit-code>" on stdout (code is 000 when no response
+# arrived). Sends no Accept header — the JSON-only "Accept: application/json"
+# gets HTTP 406 from Jira's binary endpoints (e.g. /attachment/content/{id}) —
+# and no -f, so the caller branches on both numbers: the HTTP code alone is not
+# enough, because a transfer that dies mid-body (exit 18/23/28) still reports
+# the 2xx it received, and the -o file is then truncated. Follows redirects
+# (curl stops forwarding the Authorization header when a redirect crosses
+# hosts); -S keeps curl's own reason on stderr for transport failures.
 _jr_api_binary() {
   local method=$1 path=$2 outfile=$3
   local url="$JIRA_BASE/rest/api/3$path"
-  local auth
+  local auth code rc=0
   auth=$(_jr_auth)
-  curl -s -L -o "$outfile" -w '%{http_code}' -X "$method" \
-    -H "Authorization: Basic $auth" "$url"
+  code=$(curl -sS -L -o "$outfile" -w '%{http_code}' -X "$method" \
+    -H "Authorization: Basic $auth" "$url") || rc=$?
+  echo "${code:-000} $rc"
 }
 
 # Like _jr_api but without -f: emits the response body followed by a final
@@ -2295,11 +2299,12 @@ PYEOF
   local aid=${picked%%$'\t'*} fname=${picked#*$'\t'}
 
   # Binary content: no Accept header, body straight to the file (never through
-  # stdout — keeps bytes intact under jr.ps1).
-  local code
-  code=$(_jr_api_binary GET "/attachment/content/$aid" "$out")
-  if [[ "$code" != 2* ]]; then
-    echo "jr: attachment download failed (HTTP ${code:-000})" >&2
+  # stdout — keeps bytes intact under jr.ps1). A non-zero curl exit means the
+  # transfer broke (possibly after a 2xx header), so the file is truncated.
+  local code rc
+  read -r code rc <<< "$(_jr_api_binary GET "/attachment/content/$aid" "$out")"
+  if [[ "${rc:-0}" != 0 || "$code" != 2* ]]; then
+    echo "jr: attachment download failed (HTTP ${code:-000}${rc:+, curl exit $rc})" >&2
     if [[ -s "$out" ]]; then head -c 500 "$out" >&2; echo >&2; fi
     rm -f "$out"
     return 1

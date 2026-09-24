@@ -55,13 +55,15 @@ Use `_jr_api_status` whenever the caller needs to inspect the response code
 
 ### `_jr_api_binary`
 
-Binary download helper, used by `jr attachment`. `curl -s -L -o <file>
+Binary download helper, used by `jr attachment`. `curl -sS -L -o <file>
 -w '%{http_code}'` with only the Authorization header: the body goes straight
 to the file (never through stdout — that is what keeps the bytes intact under
-`jr.ps1`), and the HTTP code (000 on transport failure) goes to stdout so the
-caller branches. It sends **no** `Accept` header and no `-f` — both JSON
-helpers always send `Accept: application/json`, and Jira's binary
-`/attachment/content/{id}` endpoint answers that with **406**.
+`jr.ps1`), and `<http-code> <curl-exit-code>` goes to stdout so the caller
+branches. Both numbers matter: a transfer that dies mid-body still reports the
+2xx it received, so the caller must also check curl's exit code. It sends
+**no** `Accept` header and no `-f` — both JSON helpers always send
+`Accept: application/json`, and Jira's binary `/attachment/content/{id}`
+endpoint answers that with **406**.
 
 ### Attachments (`jr view`, `jr attachment`)
 

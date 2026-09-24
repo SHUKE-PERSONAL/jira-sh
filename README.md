@@ -131,9 +131,9 @@ goes through `/rest/api/3/attachment/content/{id}` with a binary-safe helper
 that sends no `Accept: application/json` header (that header gets HTTP 406 from
 the endpoint) and writes bytes straight to the output file, so they never pass
 through stdout — which is also what keeps `jr.ps1` from corrupting them.
-Missing selectors, ambiguous filenames, and HTTP errors all fail with a
-non-zero exit and leave no partial output file. Upload and delete are out of
-scope; manage those in the Jira UI.
+Missing selectors, ambiguous filenames, HTTP errors, and transfers that break
+mid-download all fail with a non-zero exit and leave no partial output file.
+Upload and delete are out of scope; manage those in the Jira UI.
 
 ## Review workflow
 
