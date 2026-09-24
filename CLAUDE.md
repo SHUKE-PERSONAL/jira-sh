@@ -164,6 +164,14 @@ bash variables set inside the heredoc.
 
 ## Known constraints and past bugs
 
+- **Request bodies travel via stdin, never as a curl argv element.**
+  `_jr_api`/`_jr_api_status` pipe the body into `curl --data-binary @-`; the
+  Python heredocs (`cmd_edit` `_curl`, `cmd_create`, `jr ls` search) pass
+  `input=` to `subprocess.run`. On Windows a large ADF body passed as argv
+  overflows the ~32K `CreateProcess` command line and the spawn dies with
+  `WinError 206`. Any new PUT/POST path must use the same pattern — don't
+  write `-d "$data"`.
+
 - **CapEx is transition-screen only.** `set-field` uses `PATCH /issue/{ticket}`
   (edit endpoint), which rejects transition-screen fields with 400. `jr move`
   injects them via the transition `fields` body instead.
