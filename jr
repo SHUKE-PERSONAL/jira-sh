@@ -1154,32 +1154,114 @@ else:        print('NONE:')
 }
 
 cmd_merge() {
-  local force=0 rest=()
-  local a
-  for a in "$@"; do
-    case "$a" in
+  local force=0 pr_ref="" rest=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
       --force) force=1 ;;
-      *)       rest+=("$a") ;;
+      --pr)
+        [[ $# -ge 2 && -n "$2" ]] || { echo "jr: --pr needs a PR URL or number" >&2; return 1; }
+        pr_ref=$2; shift ;;
+      --pr=*)
+        pr_ref=${1#--pr=}
+        [[ -n "$pr_ref" ]] || { echo "jr: --pr needs a PR URL or number" >&2; return 1; } ;;
+      *)       rest+=("$1") ;;
     esac
+    shift
   done
   set -- "${rest[@]}"
-  local ticket
-  ticket=$(_jr_resolve_ticket "${1:-.}") || return 1
 
   command -v gh >/dev/null 2>&1 || { echo "jr: gh CLI not found (needed to read/merge the PR)" >&2; return 1; }
 
-  # PR for the current branch, with mergeability + authorship.
-  local pr
-  if ! pr=$(gh pr view --json number,state,mergeable,author,headRefName,baseRefName,headRepository 2>&1); then
-    echo "jr: no PR found for the current branch." >&2
-    echo "    Run from the repo with the feature branch checked out." >&2
-    echo "    If this repo needs a specific GitHub account, check gh / GH_PROFILE." >&2
-    echo "    gh: $pr" >&2
-    return 1
+  # Resolve the PR before touching GitHub or Jira: from --pr, from the current
+  # branch only when its key is the ticket's, else by searching the cwd repo for
+  # the ticket key. Never the checked-out branch's PR for an unrelated ticket.
+  local fields=number,state,mergeable,author,headRefName,baseRefName,headRepository,url,title
+  local ticket pr
+  if [[ -n "$pr_ref" ]]; then
+    if ! pr=$(gh pr view "$pr_ref" --json "$fields" 2>&1); then
+      echo "jr: cannot read PR '$pr_ref'." >&2
+      echo "    A bare number needs the PR's repo as cwd; a full URL works anywhere." >&2
+      echo "    gh: $pr" >&2
+      return 1
+    fi
+    if [[ -n "$1" ]]; then
+      ticket=$(_jr_resolve_ticket "$1") || return 1
+    else
+      # PR's own key: first <PREFIX>-<n> in its title, else in its head branch.
+      ticket=$(echo "$pr" | JIRA_PROJECT_PREFIXES="$JIRA_PROJECT_PREFIXES" python3 -c "
+import json, os, re, sys
+p = json.load(sys.stdin)
+rx = re.compile(r'(?<![A-Za-z0-9])(?:' + os.environ['JIRA_PROJECT_PREFIXES'] + r')-[0-9]+', re.I)
+for s in (p.get('title') or '', p.get('headRefName') or ''):
+    m = rx.search(s)
+    if m:
+        print(m.group(0).upper()); break
+")
+      if [[ -z "$ticket" ]]; then
+        echo "jr: PR '$pr_ref' carries no ticket key (${JIRA_PROJECT_PREFIXES}) in its title or head branch." >&2
+        echo "    Name the ticket: jr merge --pr $pr_ref <TICKET>" >&2
+        return 1
+      fi
+    fi
+  else
+    ticket=$(_jr_resolve_ticket "${1:-.}") || return 1
+    local branch_key
+    branch_key=$(git rev-parse --abbrev-ref HEAD 2>/dev/null | grep -oiE "(${JIRA_PROJECT_PREFIXES})-[0-9]+" | head -1)
+    if [[ -n "$branch_key" && "${branch_key^^}" == "${ticket^^}" ]]; then
+      # PR for the current branch, with mergeability + authorship.
+      if ! pr=$(gh pr view --json "$fields" 2>&1); then
+        echo "jr: no PR found for the current branch." >&2
+        echo "    Run from the repo with the feature branch checked out, or pass --pr <URL>." >&2
+        echo "    If this repo needs a specific GitHub account, check gh / GH_PROFILE." >&2
+        echo "    gh: $pr" >&2
+        return 1
+      fi
+    else
+      local hits pick
+      if ! hits=$(gh pr list --state all --search "$ticket" --json number,title,headRefName,state,url --limit 50 2>&1); then
+        echo "jr: cannot search PRs for $ticket in this repo." >&2
+        echo "    Pass the PR explicitly: jr merge --pr <URL> $ticket" >&2
+        echo "    gh: $hits" >&2
+        return 1
+      fi
+      # Title starts with the key (after whitespace / '['), or the head branch
+      # carries it; bounded so MT-12 never matches MT-123. Unmerged-closed PRs drop.
+      if ! pick=$(echo "$hits" | JR_KEY="$ticket" python3 -c "
+import json, os, re, sys
+key = re.escape(os.environ['JR_KEY'])
+title_rx = re.compile(r'^[\s\[]*' + key + r'(?![0-9])', re.I)
+head_rx = re.compile(r'(?<![A-Za-z0-9])' + key + r'(?![0-9])', re.I)
+hits = json.load(sys.stdin)
+match = [p for p in hits
+         if (title_rx.search(p.get('title') or '') or head_rx.search(p.get('headRefName') or ''))
+         and p.get('state') != 'CLOSED']
+if len(match) == 1:
+    print(match[0]['url']); sys.exit(0)
+shown = match or hits
+if match:
+    print('jr: %d PRs match %s; pick one:' % (len(match), os.environ['JR_KEY']), file=sys.stderr)
+else:
+    print('jr: no open or merged PR in this repo matches %s.' % os.environ['JR_KEY'], file=sys.stderr)
+    if hits:
+        print('    search hits (none matched):', file=sys.stderr)
+for p in shown:
+    print('    #%s  %-6s  %s  [%s]  %s' % (p.get('number'), p.get('state'), p.get('title'),
+                                          p.get('headRefName'), p.get('url')), file=sys.stderr)
+sys.exit(1)
+"); then
+        echo "    Pass the PR explicitly: jr merge --pr <URL> $ticket" >&2
+        return 1
+      fi
+      if ! pr=$(gh pr view "$pick" --json "$fields" 2>&1); then
+        echo "jr: cannot read PR $pick" >&2
+        echo "    gh: $pr" >&2
+        return 1
+      fi
+    fi
   fi
 
-  local state mergeable number author head base repo
-  { read -r state; read -r mergeable; read -r number; read -r author; read -r head; read -r base; read -r repo; } < <(echo "$pr" | python3 -c "
+  local state mergeable number author head base repo url
+  { read -r state; read -r mergeable; read -r number; read -r author; read -r head; read -r base; read -r repo; read -r url; } < <(echo "$pr" | python3 -c "
 import json, sys
 p = json.load(sys.stdin)
 print(p.get('state') or '')
@@ -1189,7 +1271,9 @@ print((p.get('author') or {}).get('login') or '')
 print(p.get('headRefName') or '')
 print(p.get('baseRefName') or '')
 print((p.get('headRepository') or {}).get('name') or '')
+print(p.get('url') or '')
 ")
+  echo "$ticket ← PR #$number ($url)"
 
   # Merge the PR (skip if already merged). Mergeability is mandatory: conflicts
   # must be resolved and the PR re-approved by hand first — that's out of scope.
@@ -1215,7 +1299,7 @@ print((p.get('headRepository') or {}).get('name') or '')
     fi
     echo "merging PR #$number via --$method (author: ${author:-?})…"
     local out
-    if ! out=$(gh pr merge "$number" "--$method" 2>&1); then
+    if ! out=$(gh pr merge "$url" "--$method" 2>&1); then
       echo "jr: failed to merge PR #$number" >&2
       echo "    gh: $out" >&2
       return 1
@@ -3191,7 +3275,11 @@ Commands:
                                   Finish review: move Review → Test in Branch, then fill the Code Review Checklist (tick Done, keep first 3 + last row, Action: Ready for test).
                                   --no-sql / --no-jenkins drop the SQL / Jenkins rows for tickets with no SQL changes or projects with no Jenkins pipeline.
                                   Short forms bundle: -s (no-sql), -j (no-jenkins), -f (force) — e.g. -sj skips both, -sjf also overwrites.
-  merge       [--force] [TICKET]  Merge the approved PR (squash if yours, merge otherwise), move Merge → Test in Main, then fill the Merge Results template
+  merge       [--force] [--pr <URL|N>] [TICKET]
+                                  Merge the approved PR (squash if yours, merge otherwise), move Merge → Test in Main, then fill the Merge Results template.
+                                  PR: --pr if given; else the current branch's when its key is TICKET; else the one open/merged PR in this repo
+                                  whose title starts with (or head branch carries) TICKET — none or several → error listing candidates.
+                                  --pr <URL> works outside a git repo; without TICKET, the ticket is the PR's own key (title, else head branch).
   create      --title "..." [--body "..." | --body-file path] [--project KEY] [--priority P] [--points N] [--type T] [--epic KEY]
               [--team NAME|ID] [--component NAME|ID]... [--assignee self|none|NAME] [--sprint ID|active|none] [--no-sprint] [--refine]
               [-F customfield_X=VALUE]... [--dry-run]
