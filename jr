@@ -1056,114 +1056,17 @@ print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', '
   done
 }
 
-# Build the filled "Merge Results" comment ADF (mirrors the workflow's orange
-# template). Values come from env: MR_REPO / MR_SRC / MR_TGT. "Was source branch
-# removed?" is Yes (we squash/merge with deleteBranchOnMerge); the CI cell stays
-# :question: (CI hasn't finished at merge time).
-_jr_merge_adf() {
-  MR_REPO="$1" MR_SRC="$2" MR_TGT="$3" python3 <<'PYEOF'
-import json, os
-FLAG = {"type": "emoji", "attrs": {"shortName": ":flag_on:", "id": "atlassian-flag_on", "text": ":flag_on:"}}
-Q = {"type": "emoji", "attrs": {"shortName": ":question:", "id": "atlassian-question_mark", "text": ":question:"}}
-
-repo = os.environ.get("MR_REPO", "")
-src  = os.environ.get("MR_SRC", "")
-tgt  = os.environ.get("MR_TGT", "")
-
-def header(text):
-    return {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": text, "marks": [{"type": "strong"}]}]}]}
-
-def cell_text(text):
-    if text:
-        return {"type": "tableCell", "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}]}
-    return {"type": "tableCell", "content": [{"type": "paragraph"}]}
-
-def cell_nodes(nodes):
-    return {"type": "tableCell", "content": [{"type": "paragraph", "content": nodes}]}
-
-table = {"type": "table", "attrs": {"isNumberColumnEnabled": False, "layout": "default"}, "content": [
-    {"type": "tableRow", "content": [
-        header("Repository"), header("Source branch"), header("Target branch"),
-        header("Was source branch removed?"), header("Target branch CI pipeline passed post merge?")]},
-    {"type": "tableRow", "content": [
-        cell_text(repo), cell_text(src), cell_text(tgt),
-        cell_text("Yes"), cell_nodes([Q])]},
-]}
-
-content = [
-    {"type": "heading", "attrs": {"level": 2},
-     "content": [FLAG, {"type": "text", "text": " Merge Results", "marks": [{"type": "textColor", "attrs": {"color": "#ffa500"}}]}]},
-    {"type": "heading", "attrs": {"level": 3}, "content": [{"type": "text", "text": "Details of merge"}]},
-    table,
-    {"type": "paragraph", "content": [{"type": "text", "text": "Action:", "marks": [{"type": "strong"}]}, {"type": "text", "text": " Ready to Test in Main"}]},
-]
-print(json.dumps({"body": {"type": "doc", "version": 1, "content": content}}))
-PYEOF
-}
-
-# Classify the "Merge Results" comments on a ticket. Reads the comment list on
-# stdin and my accountId as argv1; prints one of:
-#   TEMPLATE:<id>  unfilled template authored by me (data row carries no text yet)
-#   FILLED:<id>    a Merge Results comment I already filled in
-#   OTHER:<id>     a Merge Results comment authored by someone else (out of scope)
-#   NONE:          no Merge Results comment at all
-# Mine takes precedence over someone else's; an unfilled template over a filled one.
-_jr_merge_state() {
-  python3 -c "
-import json, sys
-me = sys.argv[1]
-
-def find_table(node):
-    if isinstance(node, dict):
-        if node.get('type') == 'table':
-            return node
-        for v in node.get('content', []):
-            r = find_table(v)
-            if r: return r
-    return None
-
-def count_text(node):
-    n = 0
-    if isinstance(node, dict):
-        if node.get('type') == 'text': n += 1
-        for v in node.get('content', []): n += count_text(v)
-    elif isinstance(node, list):
-        for v in node: n += count_text(v)
-    return n
-
-template = filled = other = None
-for c in json.load(sys.stdin).get('comments', []):
-    body = c.get('body', {})
-    s = json.dumps(body)
-    if 'atlassian-flag_on' not in s or 'Merge Results' not in s:
-        continue
-    if (c.get('author') or {}).get('accountId') != me:
-        other = c['id']; continue
-    tbl = find_table(body)
-    data_text = count_text(tbl['content'][1]) if tbl and len(tbl.get('content', [])) > 1 else 0
-    if data_text == 0:
-        template = c['id']
-    else:
-        filled = c['id']
-
-if template: print('TEMPLATE:' + template)
-elif filled: print('FILLED:' + filled)
-elif other:  print('OTHER:' + other)
-else:        print('NONE:')
-" "$1"
-}
-
 cmd_merge() {
-  local force=0 pr_ref="" rest=()
+  local pr_ref="" rest=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --force) force=1 ;;
       --pr)
         [[ $# -ge 2 && -n "$2" ]] || { echo "jr: --pr needs a PR URL or number" >&2; return 1; }
         pr_ref=$2; shift ;;
       --pr=*)
         pr_ref=${1#--pr=}
         [[ -n "$pr_ref" ]] || { echo "jr: --pr needs a PR URL or number" >&2; return 1; } ;;
+      -*)      echo "jr: unknown option for merge: $1" >&2; return 1 ;;
       *)       rest+=("$1") ;;
     esac
     shift
@@ -1175,7 +1078,7 @@ cmd_merge() {
   # Resolve the PR before touching GitHub or Jira: from --pr, from the current
   # branch only when its key is the ticket's, else by searching the cwd repo for
   # the ticket key. Never the checked-out branch's PR for an unrelated ticket.
-  local fields=number,state,mergeable,author,headRefName,baseRefName,headRepository,url,title
+  local fields=number,state,mergeable,author,headRefName,url,title
   local ticket pr
   if [[ -n "$pr_ref" ]]; then
     if ! pr=$(gh pr view "$pr_ref" --json "$fields" 2>&1); then
@@ -1260,17 +1163,14 @@ sys.exit(1)
     fi
   fi
 
-  local state mergeable number author head base repo url
-  { read -r state; read -r mergeable; read -r number; read -r author; read -r head; read -r base; read -r repo; read -r url; } < <(echo "$pr" | python3 -c "
+  local state mergeable number author url
+  { read -r state; read -r mergeable; read -r number; read -r author; read -r url; } < <(echo "$pr" | python3 -c "
 import json, sys
 p = json.load(sys.stdin)
 print(p.get('state') or '')
 print(p.get('mergeable') or '')
 print(p.get('number') or '')
 print((p.get('author') or {}).get('login') or '')
-print(p.get('headRefName') or '')
-print(p.get('baseRefName') or '')
-print((p.get('headRepository') or {}).get('name') or '')
 print(p.get('url') or '')
 ")
   echo "$ticket ← PR #$number ($url)"
@@ -1307,75 +1207,19 @@ print(p.get('url') or '')
     echo "PR #$number merged (--$method)"
   fi
 
-  # --- Jira side: move Merge → Test in Main, then fill the Merge Results template.
-  local me
-  me=$(_jr_api GET "/myself" | python3 -c "import json, sys; print(json.load(sys.stdin).get('accountId', ''))")
-  [[ -n "$me" ]] || { echo "jr: could not determine the current Jira user" >&2; return 1; }
-
+  # --- Jira side: move Merge → Test in Main. The workflow posts its own
+  # "Merged" comment on that transition; there is no template left to fill.
   local status
   status=$(_jr_api GET "/issue/$ticket?fields=status" | python3 -c "
 import json, sys
 print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', ''))
 ")
   [[ -n "$status" ]] || { echo "jr: ticket not found: $ticket" >&2; return 1; }
-  local moved=0
   if [[ "${status,,}" == *"test in main"* ]]; then
     echo "$ticket already in '$status' — skipping move"
   else
     cmd_move "$ticket" "Test in Main" || return 1
-    moved=1
   fi
-
-  # Moving to Test in Main triggers the workflow's "Merge Results" template,
-  # authored by us; poll for it and PUT-fill the table. A prior round may leave
-  # someone else's Merge Results comment visible before ours lands, so a foreign
-  # comment is out of scope only when we did NOT just drive the transition —
-  # otherwise we keep waiting for our own template.
-  local mbody
-  mbody=$(_jr_merge_adf "$repo" "$head" "$base") || return 1
-
-  local tries=10 mstate cid
-  while :; do
-    mstate=$(_jr_api GET "/issue/$ticket/comment" | _jr_merge_state "$me")
-    case "$mstate" in
-      TEMPLATE:*)
-        cid=${mstate#TEMPLATE:}
-        _jr_comment_write PUT "/issue/$ticket/comment/$cid" "$mbody" \
-          "failed to fill Merge Results comment $cid on $ticket" || return 1
-        echo "$ticket → Merge Results comment filled in (template $cid)"
-        return 0 ;;
-      FILLED:*)
-        cid=${mstate#FILLED:}
-        if [[ $force -eq 1 ]]; then
-          _jr_comment_write PUT "/issue/$ticket/comment/$cid" "$mbody" \
-            "failed to overwrite Merge Results comment $cid on $ticket" || return 1
-          echo "$ticket → Merge Results comment overwritten (--force, comment $cid)"
-          return 0
-        fi
-        echo "jr: $ticket already has a filled Merge Results comment ($cid); not overwriting." >&2
-        echo "    Re-run with --force to replace it." >&2
-        return 1 ;;
-      OTHER:*)
-        if [[ $moved -eq 0 ]]; then
-          echo "jr: $ticket has a Merge Results comment authored by someone else — they already moved it on; out of scope, leaving it untouched."
-          return 0
-        fi
-        # We drove the transition, so our own template is still expected to
-        # appear; a prior round's comment just landed first. Fall through to the
-        # wait-then-post path instead of bailing out.
-        ;&
-      *)
-        if [[ $tries -gt 0 ]]; then
-          [[ $tries -eq 10 ]] && echo "jr: waiting for the Merge Results template comment to appear…"
-          tries=$((tries - 1)); sleep 2; continue
-        fi
-        echo "jr: no template appeared; posting a new Merge Results comment instead"
-        _jr_comment_write POST "/issue/$ticket/comment" "$mbody" \
-          "failed to post Merge Results comment to $ticket" || return 1
-        echo "$ticket → Merge Results comment added"
-        return 0 ;;
-    esac
-  done
 }
 
 # Build the filled "Code Review Checklist" comment ADF (blue template). If a
@@ -3275,8 +3119,8 @@ Commands:
                                   Finish review: move Review → Test in Branch, then fill the Code Review Checklist (tick Done, keep first 3 + last row, Action: Ready for test).
                                   --no-sql / --no-jenkins drop the SQL / Jenkins rows for tickets with no SQL changes or projects with no Jenkins pipeline.
                                   Short forms bundle: -s (no-sql), -j (no-jenkins), -f (force) — e.g. -sj skips both, -sjf also overwrites.
-  merge       [--force] [--pr <URL|N>] [TICKET]
-                                  Merge the approved PR (squash if yours, merge otherwise), move Merge → Test in Main, then fill the Merge Results template.
+  merge       [--pr <URL|N>] [TICKET]
+                                  Merge the approved PR (squash if yours, merge otherwise), then move Merge → Test in Main.
                                   PR: --pr if given; else the current branch's when its key is TICKET; else the one open/merged PR in this repo
                                   whose title starts with (or head branch carries) TICKET — none or several → error listing candidates.
                                   --pr <URL> works outside a git repo; without TICKET, the ticket is the PR's own key (title, else head branch).
