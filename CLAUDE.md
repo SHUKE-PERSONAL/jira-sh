@@ -82,7 +82,7 @@ attachment id, and the basic-auth REST API exposes no UUID→attachment mapping 
 so rendered descriptions keep showing bare `[media]` even when the same file is
 listed under Attachments. Don't "fix" this by matching ids.
 
-### `_jr_do_transition` (lines ~105–168)
+### `_jr_do_transition` (lines ~136–204)
 
 All status moves go through this function. It handles two special validators
 that Jira enforces at transition time:
@@ -131,15 +131,14 @@ not shared because each lives inside a different heredoc scope.
 
 ## Comment state classifiers
 
-`jr resolve`, `jr approve`, and `jr merge` each poll for an auto-generated
+`jr resolve` and `jr approve` each poll for an auto-generated
 workflow template comment, fill it, and are idempotent. The classifier
 functions return a tagged string:
 
 | Function | States returned | File lines |
 |----------|----------------|-----------|
-| `_jr_resolved_state` | `TEMPLATE:<id>` `TEMPLATE_RETRY:<id>` `FILLED:<id>` `NONE:` | ~559–580 |
-| `_jr_approve_state` | `TEMPLATE:<id>` `FILLED:<id>` `OTHER:<id>` `NONE:` | ~1042–1062 |
-| `_jr_merge_state` | `TEMPLATE:<id>` `FILLED:<id>` `OTHER:<id>` `NONE:` | ~737–780 |
+| `_jr_resolved_state` | `TEMPLATE:<id>` `TEMPLATE_RETRY:<id>` `FILLED:<id>` `NONE:` | ~894–915 |
+| `_jr_approve_state` | `TEMPLATE:<id>` `FILLED:<id>` `OTHER:<id>` `NONE:` | ~1352–1373 |
 
 All detect by looking for the `atlassian-flag_on` emoji in the serialized
 comment body, then by checking for template-marker strings like `<summary>`,

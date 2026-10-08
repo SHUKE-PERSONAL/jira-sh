@@ -105,7 +105,7 @@ new ticket — pipe it to `jq`
 | `attachment <TICKET> <ID\|FILENAME> --output <PATH>` | Download one attachment (read-only — no upload/delete). Selector is the attachment id or its unique filename; see [Attachments](#attachments). |
 | `resolve [--force] [TICKET]` | Move to review, then fill the review template comment from the current branch's PR. |
 | `approve [--force] [--no-sql] [--no-jenkins] [TICKET]` | Finish review, then fill the Code Review Checklist (see below). |
-| `merge [--force] [--pr <URL\|N>] [TICKET]` | Merge the approved PR, move Merge → Test in Main, then fill the Merge Results template. The PR is `--pr` if given, else the current branch's when its key is `TICKET`, else the single open/merged PR in the cwd repo whose title starts with (or head branch carries) `TICKET` — none or several is an error that lists the candidates. `--pr <URL>` works outside a git repo; with no `TICKET`, the ticket is the PR's own key (title, else head branch). |
+| `merge [--pr <URL\|N>] [TICKET]` | Merge the approved PR, then move Merge → Test in Main (the workflow posts its own "Merged" comment). The PR is `--pr` if given, else the current branch's when its key is `TICKET`, else the single open/merged PR in the cwd repo whose title starts with (or head branch carries) `TICKET` — none or several is an error that lists the candidates. `--pr <URL>` works outside a git repo; with no `TICKET`, the ticket is the PR's own key (title, else head branch). |
 | `create --title "..." [...]` | Create a ticket from `~/.jr.toml` defaults, with per-invocation overrides (see [Creating tickets](#creating-tickets)). |
 | `edit [TICKET] [--title ...] [--body ...]` | Update the title and/or body of a ticket you reported (`--force` edits any ticket). |
 | `set-field <TICKET> <FIELD> <VALUE\|--list-options>` | Set a custom field via the Edit screen; `--list-options` lists a select field's allowed values. |
@@ -137,19 +137,20 @@ Upload and delete are out of scope; manage those in the Jira UI.
 
 ## Review workflow
 
-The three workflow commands fill the Jira templates the team's automation posts
-on each transition, so you don't hand-edit ADF tables:
+`jr resolve` and `jr approve` fill the Jira templates the team's automation posts
+on each transition, so you don't hand-edit ADF tables. `jr merge` merges the PR
+and moves the ticket; the workflow's own "Merged" comment needs no filling.
 
 ```
 jr resolve   → Review            (fill the Resolved comment from the PR)
 jr approve   → Test in Branch    (fill the Code Review Checklist)
-jr merge     → Test in Main      (fill the Merge Results table)
+jr merge     → Test in Main      (merge the PR; no comment from jr)
 ```
 
 Each is idempotent: if the ticket is already in the target status the move is
-skipped and the comment is still filled. A checklist already authored by someone
-else is left untouched; an already-filled comment is not overwritten unless you
-pass `--force`.
+skipped (and for resolve / approve the comment is still filled). A checklist
+already authored by someone else is left untouched; an already-filled comment is
+not overwritten unless you pass `--force`.
 
 ### `jr resolve`
 
